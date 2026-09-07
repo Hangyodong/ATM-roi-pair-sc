@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """bank + 템플릿 배분으로 생성한 SC 를 GT 와 비교해 그림 4장으로 저장한다.
 
-  python scripts/33_plot_sc.py --subjects sub-101070 sub-101124 sub-101476
+  python scripts/33_plot_sc.py --subjects sub-000004 sub-000005 sub-000006
 결과: outputs/figures/sc_{1_overview,2_template,3_blocks,4_tiers}.png
 """
 import argparse
@@ -232,7 +232,7 @@ def draw(a, G, P, t_pass):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="outputs/checkpoints/route2/s5_joint/seg_full_step4000.pt")
-    ap.add_argument("--subjects", nargs="+", default=["sub-101070", "sub-101124", "sub-101476"])
+    ap.add_argument("--subjects", nargs="+", default=["sub-000004", "sub-000005", "sub-000006"])
     ap.add_argument("--total", type=int, default=460_000)
     ap.add_argument("--n-bank-subj", type=int, default=12)
     ap.add_argument("--replot", action="store_true", help="저장된 결과로 그림만 다시 그린다")

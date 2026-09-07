@@ -139,7 +139,7 @@ device cuda | GPU NVIDIA A10 | VRAM 23.0 GB | cudnn 90100 | torch 2.6.0+cu124
   total loss             0.106809
   streamline gradient    PASS  (max |grad| = 2.598e-03)
 
-[B] ATM integration (AF_L pretrained, sub-100001 실제 T1/GT SC)
+[B] ATM integration (AF_L pretrained, sub-000001 실제 T1/GT SC)
   anatomy feature        (1, 512)   0.50s, 1회 호출, 두 번 호출 차이 0.0
   streamline shape       (3000, 128, 3)  chunk=1500
   SC shape               (82, 82)   symmetry error 0.000e+00
@@ -157,7 +157,7 @@ FINAL: PASS
 
 | 항목 | 결과 |
 |---|---|
-| `.tt.gz` → hard **pass** SC vs `.mat` GT (sub-100001, 1e6 streamline) | **r=0.9986**, r_log=0.9912, edge F1=0.9815 |
+| `.tt.gz` → hard **pass** SC vs `.mat` GT (sub-000001, 1e6 streamline) | **r=0.9986**, r_log=0.9912, edge F1=0.9815 |
 | 같은 데이터, hard **end** SC vs GT | **r=0.6728** |
 | 128점 재샘플 후 hard pass | r=0.9985 (ATM 의 128점 표현은 SC 병목이 아님) |
 | soft pass SC (τ=0.5, max, d_bg=2.0) vs GT | **r=0.9939, ccc=0.9854**, length r=0.8991 / MAE 9.8 mm |
@@ -175,9 +175,9 @@ python scripts/smoke_test_atm_sc.py               # endpoint 모드
 python scripts/smoke_test_atm_sc.py --mode pass
 python scripts/smoke_test_atm_sc.py --amp fp16 --n-streamlines 12000 --chunk 6000
 
-python scripts/01_verify_gt_sc.py  --sub sub-100001    # GT SC 재현 검증
-python scripts/02_prepare_t1.py    --sub sub-100001 --mode syn
-python scripts/03_validate_soft_sc.py --sub sub-100001 # τ / 집계 / 배경 스윕
+python scripts/01_verify_gt_sc.py  --sub sub-000001    # GT SC 재현 검증
+python scripts/02_prepare_t1.py    --sub sub-000001 --mode syn
+python scripts/03_validate_soft_sc.py --sub sub-000001 # τ / 집계 / 배경 스윕
 ```
 
 ---

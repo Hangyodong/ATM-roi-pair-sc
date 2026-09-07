@@ -73,7 +73,7 @@ def main(a):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--pairs", default="gt", choices=["gt", "edge"])
     ap.add_argument("--edge-thr", type=float, default=0.5)

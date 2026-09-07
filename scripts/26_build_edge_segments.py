@@ -11,7 +11,7 @@ bundles.npz 의 full streamline 을 "같은 streamline 안에서 ROI_i 와 ROI_j
     n_roi, n_points, cap, min_dwell, min_length_mm
 를 만든다. 읽기 전용이라 학습 중에도 안전하다.
 
-GT 정의 실측(sub-100001, 1M streamline): Case B(모든 ROI 쌍) r=0.9986 vs Case A(인접) r=0.781
+GT 정의 실측(sub-000001, 1M streamline): Case B(모든 ROI 쌍) r=0.9986 vs Case A(인접) r=0.781
 -> 인접 transition 이 아니라 모든 방문 ROI 쌍의 부분경로로 분해한다 (§30).
 """
 import argparse

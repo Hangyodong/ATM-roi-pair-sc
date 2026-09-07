@@ -72,7 +72,7 @@ SC 는 chunk 마다 loss 를 걸지 않고 합친 뒤 한 번 계산한다 (§24
 
 ## 4. 결과
 
-### 4.1 데이터 전처리 (sub-100001, 1,000,000 streamline)
+### 4.1 데이터 전처리 (sub-000001, 1,000,000 streamline)
 
 | 항목 | 값 |
 |---|---|
@@ -91,7 +91,7 @@ SC 는 chunk 마다 loss 를 걸지 않고 합친 뒤 한 번 계산한다 (§24
   w>=0 & init 1 / endpoint prob [N,6] sum==1 / SC [6,6] symmetry 0.0 / finite loss (8항) /
   backward / streamline gradient (max 5.4e-1) / model gradient (pair_emb, weight_head,
   edge_head, convvae 전부) / optimizer step 53/66 tensors 변경 / UNet 동결       → 전부 PASS
-[B] real  sub-100001, 8 pairs × 16 = 128 streamlines
+[B] real  sub-000001, 8 pairs × 16 = 128 streamlines
   T1 encoder 0.38 s 1회 → [1,512] · K=1759 · L_recon 680 / L_kl 94.5 / L_endpoint 35.6 /
   L_edge 0.693 / L_corr 1.006 / L_mag 1.94 / L_length 3.35 · grad 유한 · 2 step 연속 OK  → PASS
 peak VRAM 0.58 GB · 21.4 s
@@ -112,7 +112,7 @@ step 시간 (npz 메모리 상주 수정 후): 07 = 1.3 s (1 step 째, warm-up �
 
 ## 5. 발견한 문제 (중요도 순)
 
-1. **pretrained ATM 의 anatomy feature 가 거의 0 이다.** PPMI sub-100001: ‖a‖ = 0.086, T1=0 을 넣어도
+1. **pretrained ATM 의 anatomy feature 가 거의 0 이다.** PPMI sub-000001: ‖a‖ = 0.086, T1=0 을 넣어도
    0.053 (bias). 공식 예제 sub-1135 는 T1 강도 0–223 인데 정규화 상수가 8330 이라 입력이 [0, 0.026] —
    그런데도 AF_L 을 잘 재현한다. 즉 **pretrained 모델에서 T1 조건화는 사실상 비활성이고 bundle
    geometry 는 KDE latent 은행이 실어 나른다.** subject-specific 생성이라는 전제에 직접 관련된 발견이다.
@@ -161,7 +161,7 @@ loss(endpoint/SC)에서만 나올 수 있고, 이는 배치 전처리 완료 후
 | | endpoint rule | pass rule |
 |---|---|---|
 | GT `.mat` SC 와의 일치 (같은 tractogram, hard) | r = 0.673 | **r = 0.9986** |
-| density (sub-100001) | 0.530 (K=1759) | 0.839 |
+| density (sub-000001) | 0.530 (K=1759) | 0.839 |
 | soft(미분가능) 버전 vs GT | — | r = 0.9939, ccc = 0.985 |
 | 파이프라인 문서의 bundle 정의 | **endpoint** (§5) | — |
 
@@ -170,7 +170,7 @@ loss(endpoint/SC)에서만 나올 수 있고, 이는 배치 전처리 완료 후
 tractogram 의 pass-SC 는 잘 정의되고 `.mat` 과 직접 비교된다. 둘을 섞어 endpoint soft-SC 를 `.mat` 에
 맞추면 상한이 0.67 이다. `--sc-mode` 한 플래그로 전환된다.
 
-### Phase 2 결과 (sub-100001, 500 step, β 스윕)
+### Phase 2 결과 (sub-000001, 500 step, β 스윕)
 
 | β | L_recon | RMSE | KL | prior z 생성 pair acc | posterior-bank z pair acc |
 |---|---|---|---|---|---|
@@ -196,9 +196,9 @@ AMP: fp16 max 6 mm / bf16 max 57 mm 좌표 오차 → 기본 off, bf16 사용 �
 ## 7. 실행
 
 ```bash
-python scripts/01_qc_coordinate_space.py --sub sub-100001      # 정합 + PNG
-python scripts/02_assign_roi_pairs.py --sub sub-100001         # ~90 s
-python scripts/03_build_roi_pair_bundles.py --sub sub-100001   # ~20 s
+python scripts/01_qc_coordinate_space.py --sub sub-000001      # 정합 + PNG
+python scripts/02_assign_roi_pairs.py --sub sub-000001         # ~90 s
+python scripts/03_build_roi_pair_bundles.py --sub sub-000001   # ~20 s
 python scripts/05_build_distance_maps.py
 python -m pytest tests -q
 python scripts/06_smoke_test.py                                 # synthetic + real

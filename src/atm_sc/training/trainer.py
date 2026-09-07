@@ -115,7 +115,7 @@ class TrainConfig:
     sc_log_corr: bool = True             # L_corr 를 log1p 도메인 Pearson 으로 (raw 는 큰 edge 몇 개가 지배)
     block_weights: tuple = (1.0, 1.0, 1.0)
     sc_global_weight: float = 0.0        # GESTA 전략 §46: L_corr = λ_type·(block 평균) + λ_global·(whole-brain). 0 = block 만
-    route_tau: float = 1.0               # 실측(sub-100001 GT streamline): 통과 ROI 확률 중앙값이
+    route_tau: float = 1.0               # 실측(sub-000001 GT streamline): 통과 ROI 확률 중앙값이
                                          # tau 0.5/1/2/5 에서 0.98/0.83/0.58/0.32. tau 가 크면 완벽한 경로도
                                          # p<0.5 라 target 1 에 닿지 못한다. log 공간이라 작은 tau 여도 gradient 는 산다.
     route_mode: str = "bce"              # 'bce' | 'dice' | 'both'

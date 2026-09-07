@@ -15,7 +15,7 @@ from atm_sc.training.trainer import TrainConfig         # noqa: E402
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--subjects", nargs="+", default=["sub-100001"])
+    ap.add_argument("--subjects", nargs="+", default=["sub-000001"])
     ap.add_argument("--max-steps", type=int, default=5)
     ap.add_argument("--sc-mode", default="endpoint", choices=["endpoint", "pass"])
     ap.add_argument("--n-gen", type=int, default=4, help="양성 pair 당 생성 수")

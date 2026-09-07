@@ -5,7 +5,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-SUB = "sub-100001"
+SUB = "sub-000001"
 NEEDED = [ROOT / "outputs/roi_pairs" / SUB / "bundles.npz",
           ROOT / "outputs/cache" / f"{SUB}_anat_AF_L.npy",
           ROOT / "outputs/cache/dist_maps.npy"]

@@ -37,7 +37,7 @@ def sc_magnitude_loss(sc_pred, sc_gt, normalize: str = "sum", masks: dict | None
 def sc_scale_loss(sc_pred, sc_gt, masks: dict | None = None) -> torch.Tensor:
     """총합의 로그 차이 |log(sum pred) - log(sum gt)|. 스칼라 하나로 전역 배율을 직접 학습한다.
 
-    실측(test sub-101070, phase6 checkpoint): 예측 합 161,056 vs GT 7,673,899 (48배).
+    실측(test sub-000004, phase6 checkpoint): 예측 합 161,056 vs GT 7,673,899 (48배).
     배율 하나만 곱하면 CCC 가 0.024 -> 0.817 로 뛴다. 즉 절대 스케일 문제의 대부분이 이 상수다.
     총합 정규화된 magnitude loss 는 이 상수를 볼 수 없으므로 별도 항이 필요하다.
     """

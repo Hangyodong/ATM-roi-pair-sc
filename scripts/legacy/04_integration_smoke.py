@@ -24,7 +24,7 @@ from atm_sc import losses as L                            # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-BUNDLE, SUB, N_ROI = "AF_L", "sub-100001", 82
+BUNDLE, SUB, N_ROI = "AF_L", "sub-000001", 82
 
 t1 = np.load(ROOT / "outputs" / "cache" / f"{SUB}_T1w_syn_W.npy")
 norm = BundleNorm.from_upstream(BUNDLE)

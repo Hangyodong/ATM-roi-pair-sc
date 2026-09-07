@@ -33,7 +33,7 @@ def main(sub, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--n", type=int, default=20000)
     a = ap.parse_args()
     main(a.sub, a.n)

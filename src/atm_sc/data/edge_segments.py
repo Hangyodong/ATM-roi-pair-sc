@@ -1,6 +1,6 @@
 """Full streamline -> SC edge-aligned segment 분해 (ATM_SC_EDGE_ALIGNED_BUNDLE_DUAL_REPRESENTATION_STRATEGY.md §4-7, §30-35).
 
-**GT 정의 실측 (sub-100001, 전체 1M streamline):**
+**GT 정의 실측 (sub-000001, 전체 1M streamline):**
     Case A 인접 transition만    r=0.781  log r=0.569  edge 700 / GT 2785
     Case B 같은 streamline 의 모든 ROI 쌍  r=0.9986 log r=0.9912  edge 2774 / GT 2785
 따라서 이 데이터의 GT pass-SC 는 **Case B** 다. 문서 §30 의 "all-pass-pair 방식" 에 해당하므로

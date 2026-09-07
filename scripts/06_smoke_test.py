@@ -48,7 +48,7 @@ def synthetic(device, sc_mode):
     m = ROIPairATM(n_roi=R, coord_min=lo, coord_max=hi, device=device)
     ea = EndpointAssigner(dist, affine, tau=0.5, device=device,
                           d_bg=None if sc_mode == "endpoint" else 2.0)
-    # 실측: pretrained UNet 의 anatomy feature 는 |a|~0.09, std~0.004 (PPMI sub-100001).
+    # 실측: pretrained UNet 의 anatomy feature 는 |a|~0.09, std~0.004 (PPMI sub-000001).
     # std 1 난수를 넣으면 FiLM 이 발산해 encoder 가 inf/nan 을 낸다.
     a = torch.randn(1, 512, device=device) * 0.004
     pairs = torch.as_tensor(subj.pair_ids, device=device).repeat_interleave(8, 0)
@@ -239,7 +239,7 @@ def trainable_encoder(device, sub, sc_mode, n_pairs, n_gen):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sc-mode", default="endpoint", choices=["endpoint", "pass"])
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--n-pairs", type=int, default=8)
     ap.add_argument("--n-gen", type=int, default=16)
     ap.add_argument("--skip-real", action="store_true")

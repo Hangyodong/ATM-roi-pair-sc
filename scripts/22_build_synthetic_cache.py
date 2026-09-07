@@ -2,7 +2,7 @@
 """GESTA 전략 Phase 3–4: TRAIN subject 의 pooled latent bank + under-represented bundle synthetic cache.
 
   python scripts/22_build_synthetic_cache.py --ckpt outputs/checkpoints/phase2_geometry/geometry_step3000.pt --bank --augment
-  python scripts/22_build_synthetic_cache.py --ckpt ... --augment --subjects sub-100001      # 1명 smoke
+  python scripts/22_build_synthetic_cache.py --ckpt ... --augment --subjects sub-000001      # 1명 smoke
 
 GPU 필요 (ES/DS). GT (assignments/bundles/.mat) 는 읽기만 한다 — 실행 전후 해시로 확인 (§79 SC target invariance).
 """

@@ -102,7 +102,7 @@ def main(sub, taus, aggs, dbgs, max_tracks, device):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--taus", type=float, nargs="+", default=[0.25, 0.5, 1.0])
     ap.add_argument("--aggs", nargs="+", default=["max", "lse"])
     ap.add_argument("--dbgs", type=float, nargs="+", default=[-1, 1.0, 2.0, 4.0])

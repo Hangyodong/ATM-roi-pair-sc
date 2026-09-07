@@ -1,8 +1,5 @@
 phase: sc
-subjects:
-- sub-100001
-- sub-100268
-- sub-100878
+subjects: outputs/splits/sanity.txt   # subject ID 목록 (저장소에 없다)
 max_steps: 100
 out_dir: outputs/checkpoints/sanity_full
 trainable: full

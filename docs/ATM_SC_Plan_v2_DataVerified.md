@@ -79,7 +79,7 @@ manifest 집계: `group` PD 197 / HC 66 · `proto` tr25 223 / ep2d 40 ·
 디코더를 작성해 검증했다 (버퍼를 **정확히 소진**, `consumed_exactly=True`):
 
 ```
-sub-100001   track  635,859 + track1  364,141 = 1,000,000 streamlines
+sub-000001   track  635,859 + track1  364,141 = 1,000,000 streamlines
              41,983,963 + 24,057,010 = 66,040,973 points
              평균 66.0 point/streamline  (step 1mm → 평균 약 65 mm)
 ```
@@ -110,7 +110,7 @@ info  : "... SC_weight=streamline count(pass), SC_length=mean length mm (QSDR 1e
 `FC_raw(82,82), FC_raw_z(82,82), SC_weight(82,82), SC_length(82,82), dwi_qc,`
 `updrs3, updrs3_gap_months, updrs3_tremor, updrs3_rigidity, updrs3_brady`
 
-sub-100001 기준: SC upper-tri 3321개 중 **nonzero 2785 (density 83.9 %)**,
+sub-000001 기준: SC upper-tri 3321개 중 **nonzero 2785 (density 83.9 %)**,
 총합 6.90e6, 상위 10 % edge가 전체 weight의 **68.9 %**, GT edge length 평균 152.4 mm.
 
 ### 2.4 GT SC 재현 검증 — 좌표 체인 전체를 확인했다
@@ -119,7 +119,7 @@ sub-100001 기준: SC upper-tri 3321개 중 **nonzero 2785 (density 83.9 %)**,
 tt voxel/32 ──trans_to_mni──▶ MNI mm ──inv(atlas.affine)──▶ atlas voxel ──▶ ROI label
 ```
 
-sub-100001의 1,000,000 streamline 전부를 디코딩해 두 가지 정의로 SC를 만들고 GT와 비교했다.
+sub-000001의 1,000,000 streamline 전부를 디코딩해 두 가지 정의로 SC를 만들고 GT와 비교했다.
 
 | 정의 | sum (GT 6.90e6) | nnz (GT 2785) | Pearson r | r(log1p) | edge F1 |
 |---|---|---|---|---|---|
@@ -387,7 +387,7 @@ train/test에 스캐너가 몰리지 않도록 해야 한다.
 ## 부록 A. 검증에 사용한 코드
 
 `scratchpad/verify_sc.py` — `.tt.gz` 디코딩 → MNI mm → atlas ROI → `end`/`pass` SC 및 length,
-`.mat`의 GT와 대조. sub-100001 기준 약 70 초. `src/atm_sc/data/tt_io.py`의 기반이 된다.
+`.mat`의 GT와 대조. sub-000001 기준 약 70 초. `src/atm_sc/data/tt_io.py`의 기반이 된다.
 
 ## 부록 B. 이 문서가 근거로 삼은 실측 목록
 
@@ -395,8 +395,8 @@ train/test에 스캐너가 몰리지 않도록 해야 한다.
 - `atmvae_AF_L.pth` `strict=True` 로드 · 파라미터 51.38 M / UNet 49.86 M / decoder 627 K
 - `ConvVAE.decode` 실제 forward: `[N,64] → [N,3,128] → [N,128,3]`
 - `kde_models/AF_L/kde_model.joblib` 로드 · tophat/bw=1/447,000×64
-- `PPMI_QC263_tracto.zip` manifest 263행 집계 + 5 subject 실측 (`sub-100001, 100005, 100268, 3385, 4011`)
-- `sub-100001` 1,000,000 streamline 전량 디코딩 및 GT SC 재현
+- `PPMI_QC263_tracto.zip` manifest 263행 집계 + 5 subject 실측 (`sub-000001, 100005, 100268, 3385, 4011`)
+- `sub-000001` 1,000,000 streamline 전량 디코딩 및 GT SC 재현
 - `DesikanCortexPD25_*.nii.gz` 82 라벨 확인
 - `FC_DKPD25_82_ppmi_all_nomed_qc.mat` 238행 스키마
 - 실행 환경 (GPU/패키지/바이너리) 조사

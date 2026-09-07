@@ -92,7 +92,7 @@ def main(sub, tt_path):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--tt", default=None, help="기본: ppmi_probe/PPMI_QC263_tracto/<sub>/<sub>_tract.tt.gz")
     a = ap.parse_args()
     main(a.sub, a.tt or str(tt_path(a.sub)))

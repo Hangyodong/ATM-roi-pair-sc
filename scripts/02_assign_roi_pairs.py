@@ -73,7 +73,7 @@ def run(sub, img, atlas, cross_check=True):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--no-cross-check", action="store_true")
     a = ap.parse_args()

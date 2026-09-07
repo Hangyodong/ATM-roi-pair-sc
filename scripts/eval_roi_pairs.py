@@ -18,7 +18,7 @@ from atm_sc.training.run import anatomy_feature                    # noqa: E402
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--checkpoints", nargs="*", default=[])
     ap.add_argument("--n-pairs", type=int, default=64, help="count 상위 pair 수")
     ap.add_argument("--n-per-pair", type=int, default=16)

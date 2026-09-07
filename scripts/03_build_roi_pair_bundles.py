@@ -85,7 +85,7 @@ def run(sub, img, atlas, cap, seed):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--cap", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)

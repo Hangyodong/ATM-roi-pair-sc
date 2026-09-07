@@ -10,7 +10,7 @@ streamline 좌표까지 gradient 가 흐른다.
   visit_probs      streamline 이 ROI 를 "통과"했는지. GT SC 가 pass 정의이므로
                    이쪽이 GT 를 재현한다.
 
-실측 (sub-100001, 200k streamline, .mat 의 GT SC 대조):
+실측 (sub-000001, 200k streamline, .mat 의 GT SC 대조):
     endpoint 규칙(hard)  r=0.673
     pass 규칙(hard)      r=0.9986
     pass 규칙(soft, tau=0.5 / max / d_bg=2.0)  r=0.9939, ccc=0.9854

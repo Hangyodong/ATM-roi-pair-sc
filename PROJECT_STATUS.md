@@ -10,7 +10,7 @@ GT SC = **pass** count (`.mat`), endpoint 모드 target 은 재계산한 `sc_end
 
 ## 핵심 수치
 pass-SC 재현 r=0.9986 · soft pass-SC r=0.9939 · 2-pass gradient 오차 0 · 인코더 전용 UNet bit-exact ·
-sub-100001 양성 pair 1759 (endpoint) · decode 260k streamlines/s · **pretrained anatomy feature ‖a‖=0.086 (거의 0)**.
+sub-000001 양성 pair 1759 (endpoint) · decode 260k streamlines/s · **pretrained anatomy feature ‖a‖=0.086 (거의 0)**.
 
 ## 환경
 A10 23GB. torch 2.6+cu124, cuDNN 9.1 (cu13→cu12 교체로 수리), dipy, antspyx (scipy 1.15.3 으로 다운그레이드됨), statsmodels 0.15.

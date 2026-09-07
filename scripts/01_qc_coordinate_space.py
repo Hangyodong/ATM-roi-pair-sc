@@ -89,7 +89,7 @@ def lr_png(t1, vox, mm, centroid_vox, path, title):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--mode", default="syn", choices=["syn", "rigid"])
     ap.add_argument("--n-tracks", type=int, default=20000)
     a = ap.parse_args()

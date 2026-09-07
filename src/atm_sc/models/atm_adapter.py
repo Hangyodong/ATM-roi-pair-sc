@@ -80,7 +80,7 @@ class BundleNorm:
         `target` 이 되도록 스케일을 맞춘다. PPMI T1 은 native max 가 878 ~ 203,163 으로
         subject 마다 230배까지 달라(스캐너/프로토콜) upstream 의 고정 상수(8330)만으로는
         정규화 후 >1 인 voxel 이 39 % 인 subject 가 생기고 anatomy feature 가 40배 커진다.
-        target=0.6 은 sub-100001(정규화 후 max 0.66) 이 있던 영역이다.
+        target=0.6 은 sub-000001(정규화 후 max 0.66) 이 있던 영역이다.
 
         unit=True: 결과를 [0,1] 로 보장한다 (전처리 프로토콜). robust 스케일링만으로는
         상위 0.5 % 가 1 을 넘는다 (실측 max 1.208, 1.237). pct 백분위를 1.0 에 맞추고

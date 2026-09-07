@@ -1,6 +1,6 @@
 """subject 하나의 ROI-pair 학습 데이터 (pipeline §3, §6).
 
-    s = ROIPairSubject("sub-100001")
+    s = ROIPairSubject("sub-000001")
     s.pair_ids            [K,2] 양성 canonical pair
     s.get_pair(k)         -> (streamlines [n,128,3] float32 tensor, lengths [n] tensor)
     s.sample_pairs(32, rng)

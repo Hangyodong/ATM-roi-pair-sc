@@ -38,7 +38,7 @@ def main(sub, mode, probe_tracks):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sub", default="sub-100001")
+    ap.add_argument("--sub", default="sub-000001")
     ap.add_argument("--mode", default="syn", choices=["syn", "rigid"])
     ap.add_argument("--probe-tracks", type=int, default=20000)
     a = ap.parse_args()

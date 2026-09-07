@@ -1,6 +1,6 @@
 """L_edge = BCE(P(edge), GT_edge)  (pipeline §10).
 
-positive/negative 불균형을 반드시 확인한다 (§34). sub-100001 endpoint rule 기준 양성
+positive/negative 불균형을 반드시 확인한다 (§34). sub-000001 endpoint rule 기준 양성
 pair 는 3321 개 중 약 절반이라 심하지 않지만, subject 와 rule 에 따라 달라지므로
 pos_weight 를 밖에서 넘길 수 있게 둔다.
 """

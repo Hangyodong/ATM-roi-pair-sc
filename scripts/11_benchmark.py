@@ -63,11 +63,11 @@ def main():
     norm = BundleNorm.from_upstream(a.bundle)
     atm = ATMBundle(a.bundle, norm, device=dev); atm.freeze_unet()
 
-    cache = CACHE / "sub-100001_T1w_syn_W.npy"
+    cache = CACHE / "sub-000001_T1w_syn_W.npy"
     if cache.exists():
         x = torch.tensor(norm.normalize_t1(np.load(cache)).reshape(1, 1, *W_SHAPE), dtype=torch.float32)
         t_enc, v_enc, feat = timed(lambda: atm.encode_anatomy(x), 1)
-        print(f"T1 encoder (sub-100001, 1회): {t_enc:.2f}s  peak VRAM {v_enc:.2f} GB")
+        print(f"T1 encoder (sub-000001, 1회): {t_enc:.2f}s  peak VRAM {v_enc:.2f} GB")
     else:
         feat = torch.randn(1, 512, device=dev); t_enc = float("nan")
         print("T1 캐시 없음 -> 무작위 anatomy feature 사용")

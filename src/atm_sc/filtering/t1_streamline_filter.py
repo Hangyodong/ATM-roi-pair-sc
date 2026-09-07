@@ -35,7 +35,7 @@ class FilterConfig:
     max_winding_deg: float = 0.0     # 총 회전량 상한 (0 이면 생략). loop/헤맴 탐지 (GESTA QC §11.5)
     min_end_ratio: float = 0.0       # 직선거리/경로길이 하한 (0 이면 생략)
     dedup_tol_mm: float = 0.1        # 점별 평균 거리가 이보다 작으면 근접 중복. 0 이면 생략.
-                                     # GT 로 보정(sub-100001, 15k streamline): 통과율 tol 0.1/0.2/0.5/1.0 에서
+                                     # GT 로 보정(sub-000001, 15k streamline): 통과율 tol 0.1/0.2/0.5/1.0 에서
                                      # 0.999/0.981/0.761/0.482. 같은 bundle 의 진짜 GT 가 서로 비슷하므로
                                      # 1 mm 는 GT 의 절반을 지운다.
     require_finite: bool = True

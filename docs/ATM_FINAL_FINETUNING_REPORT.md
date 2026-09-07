@@ -128,7 +128,7 @@ full unfreeze: peak **16.16 GB** (23 GB A10), step **2.26 s** 평균(warm 1.75 s
 - 전처리를 CPU job 으로 이관: `scripts/pbs_preprocess.sh` → **82756.KITSM02** (`base_8`, ncpus 8, 4 subject 병렬 × ITK 2 스레드, `--reverse` 로 로컬 배치와 반대 방향) — 제출 즉시 R. R 전환을 감시하는 watcher 가 로컬 배치를 자동 중단(충돌 방지). `std_q`, `base_32` 는 이 계정에 권한 없음.
 - 로컬 A10 학습 현황: phase 2 geometry 3000 step 완료 (val 3명: pair_acc 0.009, pass-SC r_w 0.50, 길이 110 mm — endpoint loss 이전이라 예상 범위) → phase 3 t1_encoder 진행 중 (full UNet, 118 subject, 2.6 s/step, VRAM 18.6 GB).
 - 모니터: `scripts/20_monitor.py` (`--watch 60`) — 전 phase 진행률·s/step·ETA(대기 phase 는 실측 + loss 별 추가 비용 추정), 설정(LR/λ), 현재 phase loss·gradient·dL/da 추이(sparkline), phase 별 val 표, lock/GPU/PBS/전처리 상태.
-- 전처리 배치 실패 1명: sub-182427 (정합 후 streamline 60.8 % 만 뇌 안, assert) → 자동 제외.
+- 전처리 배치 실패 1명: sub-000007 (정합 후 streamline 60.8 % 만 뇌 안, assert) → 자동 제외.
 
 ## 11. 발견된 문제
 
@@ -181,7 +181,7 @@ full unfreeze: peak **16.16 GB** (23 GB A10), step **2.26 s** 평균(warm 1.75 s
 | tier | GT edge 강도(.mat pass 값) ≤100 소 / ≤1000 중 / >1000 대 (206명 nonzero edge 33/67 백분위 92/1282 반올림, 고정 경계) |
 | `L_SC_corr` | block 별 **log1p Pearson** 의 평균 (`sc_corr_group_loss`, `TrainConfig.sc_groups='block'`, `sc_log_corr=True`, `block_weights`) |
 | `L_SC_mag`, `L_length` | block 별 masked 평균의 평균 (`masks=`) |
-| pair 샘플링 | recon/edge 양성 pair 를 tier 마다 같은 개수 (`TrainConfig.pair_sampling='tier'`; 'log'/'uniform' 은 이전 방식). sub-100268: log 0.08/0.21/0.71 → tier 0.34/0.34/0.33 |
+| pair 샘플링 | recon/edge 양성 pair 를 tier 마다 같은 개수 (`TrainConfig.pair_sampling='tier'`; 'log'/'uniform' 은 이전 방식). sub-000002: log 0.08/0.21/0.71 → tier 0.34/0.34/0.33 |
 | 생성 pass | 변경 없음 (모든 pair × 4, pair 당 동일 가중) |
 | val | count 상위 64 대신 block × tier 9 cell × 8 pair 층화; 전체·block·tier 별 pair_acc, SC r/r_log/CCC/log-MAE (`val_pairs_per_cell`). `19_train_pipeline.py --reval ckpt…` 로 기존 checkpoint 재평가 |
 | 로그/모니터 | `corr_r_<block>`, `sc_rlog_<block>`, `recon_tier_<tier>`; 모니터에 block/tier 표 |
@@ -221,7 +221,7 @@ full unfreeze: peak **16.16 GB** (23 GB A10), step **2.26 s** 평균(warm 1.75 s
 
 ### 15.3 실측·검증
 
-- **GT 통과 정보가 GT pass-SC 와 일치**: sub-100001 에서 co-visitation 으로 만든 SC vs `.mat` pass-SC **r = 0.941, log r = 0.971**. 전 subject 206명 생성 완료(3 s/subject, 0.2 MB, 평균 통과 ROI 5.1).
+- **GT 통과 정보가 GT pass-SC 와 일치**: sub-000001 에서 co-visitation 으로 만든 SC vs `.mat` pass-SC **r = 0.941, log r = 0.971**. 전 subject 206명 생성 완료(3 s/subject, 0.2 MB, 평균 통과 ROI 5.1).
 - **route_tau 보정**: GT streamline 으로 잰 통과 ROI 확률 중앙값이 tau 0.5/1/2/5 에서 0.98/0.83/0.58/**0.32**. tau 가 크면 완벽한 경로도 target 1 에 닿지 못하므로 **기본값 1.0**(log 공간이라 gradient 는 유지). 지표 임계값 0.3.
 - **끝점은 맞고 중간만 다른 streamline** (§18 도로 비유) 회귀 테스트: endpoint loss 변화 < 1e-4, route loss 4.3배 증가.
 - 실제 subject CPU step: `L_route` 1.43, `L_route_gen` 1.82, `L_presence` 2.68 모두 유한, decoder/heads gradient > 0.
@@ -237,7 +237,7 @@ full unfreeze: peak **16.16 GB** (23 GB A10), step **2.26 s** 평균(warm 1.75 s
 
 ### 16.1 문서의 전제 검증 (§26–30, §42) — 결론이 바뀌는 부분
 
-전체 tractogram(sub-100001, 1,000,000 streamline)으로 두 정의를 계산해 GT `.mat` 와 비교했다.
+전체 tractogram(sub-000001, 1,000,000 streamline)으로 두 정의를 계산해 GT `.mat` 와 비교했다.
 
 | GT SC 정의 | r | log r | 합계비 | nonzero edge (GT 2785) | segment/streamline |
 |---|---|---|---|---|---|
@@ -258,7 +258,7 @@ GT edge 의 25 % 만 생성되고 상관도 0.78 로 떨어진다. §30 의 두 
 | `data/dataset.py` | `has_edge_segments`, `edge_pair_ids`, `edge_count_full`, `edge_segments(e)`, `edge_segment_lengths(e)` |
 | `tests/test_edge_segments.py` | dwell/jitter, 인접이 아닌 전체 쌍(6개) 생성, 부분경로 구간, 짧은 segment 제거, SC 재구성 |
 
-실측(sub-100001): 150,721 streamline → **1,713,357 segment (11.4/streamline), edge 2425개**, 32점 재샘플,
+실측(sub-000001): 150,721 streamline → **1,713,357 segment (11.4/streamline), edge 2425개**, 32점 재샘플,
 edge 당 cap 128 저장 시 **33 MB · 99 s/subject**. 분해 SC vs GT `.mat` **r 0.946 / log r 0.954, GT edge 재현 0.869**
 (bundles.npz 가 endpoint-pair 당 256 로 잘려 있어 희귀 pass-edge 가 덜 잡힌다).
 
