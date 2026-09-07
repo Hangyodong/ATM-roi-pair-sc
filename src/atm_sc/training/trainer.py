@@ -111,6 +111,8 @@ class TrainConfig:
     resid_stats: str | None = None        # train split 전용 SC 통계 npz (data/sc_template.py)
     count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
     cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
+    pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
+    anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
     local_source: str = "rigid"           # 그 캐시의 프로토콜 (s1b_feats/{sub}_{source}.npz)
     resid_beta: float = 1.0               # SmoothL1 의 beta (정규화 잔차 단위)
     resid_momentum: float = 0.02          # ResidualCorr 의 subject 평균 EMA 계수
@@ -308,10 +310,10 @@ class Trainer:
                 mu_pc, ls_pc = m.prior_params(pc, anatomy=a_leaf)
                 zc = mu_pc + torch.exp(ls_pc.detach()) * eps[i:i + cfg.chunk]
                 if cfg.amp_dtype is None:
-                    S = m.decode(zc, c)
+                    S = m.decode(zc, c, pc)
                 else:
                     with torch.autocast(self.device.type, dtype=cfg.amp_dtype):
-                        S = m.decode(zc, c)
+                        S = m.decode(zc, c, pc)
                     S = S.float()
                 w = None if cfg.weight_mode == "count" else m.weights(c, zc)
                 if cfg.weight_mode != "head":
@@ -444,7 +446,7 @@ class Trainer:
                 rw = None
             c = m.condition(a_leaf, P_gt, local=self.cond_local(subject.sub, P_gt))
             mu, logvar = m.encode_streamlines(S_gt, c)
-            rec = m.decode(m.reparameterize(mu, logvar), c)
+            rec = m.decode(m.reparameterize(mu, logvar), c, P_gt)
             l_rec = L.stream_recon_loss(rec, S_gt, weights=rw)
             mu_p, ls_p = m.prior_params(P_gt, anatomy=a_leaf)
             # KL 은 prior 를 **고정 목표**로만 쓴다 (detach). C11 참조.
@@ -499,7 +501,7 @@ class Trainer:
             c = m.condition(a_leaf, P_sg, mode=1,                     # mode 1 = segment
                             local=self.cond_local(subject.sub, P_sg))
             mu, logvar = m.encode_streamlines(S_sg, c)
-            rec = m.decode(m.reparameterize(mu, logvar), c)
+            rec = m.decode(m.reparameterize(mu, logvar), c, P_sg)
             l_sr = L.stream_recon_loss(rec, S_sg)
             mu_ps, ls_ps = m.prior_params(P_sg, mode=1, anatomy=a_leaf)
             l_sk = L.kl_loss(mu, logvar, mu_ps.detach(), 2.0 * ls_ps.detach())

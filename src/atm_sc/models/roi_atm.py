@@ -86,6 +86,9 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
     kw.setdefault("prior_use_anatomy", bool(sd.get("prior_use_anatomy", False)))
     kw.setdefault("count_local_dim", int(sd.get("count_local_dim", 0)))
     kw.setdefault("cond_local_dim", int(sd.get("cond_local_dim", 0)))
+    if sd.get("pair_anchor"):
+        kw.setdefault("pair_anchor", sd["pair_anchor"])
+        kw.setdefault("anchor_alpha", float(sd.get("anchor_alpha", 0.0)))
     if sd.get("refiner"):
         kw.setdefault("refiner", sd["refiner"])
     m = ROIPairATM(n_roi=n_roi, trainable="full" if lv == "full" else "vae", unet_level=lv,
@@ -103,7 +106,8 @@ class ROIPairATM(nn.Module):
                  trainable: str = "vae", device="cuda", models_dir=None, unet_level: str | None = None,
                  in_channels: int = 2, template=None, use_refiner: bool = False,
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
-                 count_local_dim: int = 0, cond_local_dim: int = 0):
+                 count_local_dim: int = 0, cond_local_dim: int = 0,
+                 pair_anchor: str | bool | None = None, anchor_alpha: float = 0.0):
         """trainable: 'decoder' | 'vae' | 'vae+unet4' | 'full'.
         unet_level: 'none' | 'stage4' | 'stage3' | 'stage2' | 'full'. 주면 trainable 의 UNet 부분을 덮어쓴다.
         'full' = VAE 인코더/디코더 + UNet 전체 + heads (최종 전략 §2).
@@ -131,6 +135,13 @@ class ROIPairATM(nn.Module):
         self.pair_emb = ROIPairEmbedding(n_roi, emb_dim, ANATOMICAL_DIM, latent_dim=LATENT_DIM,
                                          prior_use_anatomy=prior_use_anatomy,
                                          local_dim=int(cond_local_dim)).to(self.device)
+        # pair 앵커 재매개화 (models/pair_anchor.py). 전역 박스가 실제 pair 범위의 28배 부피라
+        # z/prior 가 "뇌 어디쯤"까지 떠안고 있다. alpha=0 이면 기존 동작과 bit-exact 다.
+        self.anchor = None
+        if pair_anchor:
+            from .pair_anchor import load as _load_anchor
+            self.anchor = _load_anchor(None if pair_anchor is True else pair_anchor,
+                                       n_roi=n_roi, alpha=anchor_alpha).to(self.device)
         self.weight_head = StreamlineWeightHead(ANATOMICAL_DIM, LATENT_DIM).to(self.device) \
             if use_weight_head else None
         # 그룹 템플릿 인수분해 (재학습 설계 §2 ③): head 는 템플릿 위의 **개인차만** 학습한다.
@@ -296,8 +307,17 @@ class ROIPairATM(nn.Module):
         local [N, D] 은 pair_emb 이 local_dim > 0 으로 만들어졌을 때만 준다."""
         return self.pair_emb(anatomy, canonical_pairs(pairs), mode, local)
 
-    def decode(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        mm = self.atm.decode_mm(z, cond)
+    def decode(self, z: torch.Tensor, cond: torch.Tensor,
+               pairs: torch.Tensor | None = None) -> torch.Tensor:
+        """pairs 를 주고 anchor 가 켜져 있으면 좌표를 pair 앵커 기준으로 재매개화한다.
+        anchor.alpha = 0 이면 기존 경로와 bit-exact 다."""
+        if self.anchor is not None and float(self.anchor.alpha) != 0.0:
+            assert pairs is not None, "pair 앵커가 켜져 있는데 decode 에 pairs 가 안 넘어왔다"
+            raw = self.atm.decode_raw(z, cond)
+            mm_global = (raw + 1.0) * self.atm.coord_scale + self.atm.coord_min
+            mm = self.anchor(raw, canonical_pairs(pairs), mm_global)
+        else:
+            mm = self.atm.decode_mm(z, cond)
         if self.refiner is None:
             return mm
         # 0-init 상태에서는 delta == 0 이라 이 분기는 기존 출력과 bit-exact 동일하다.
@@ -406,9 +426,9 @@ class ROIPairATM(nn.Module):
                     lc = pair_local(local_roi, canonical_pairs(pc))
                 c = self.condition(anatomy, pc, local=lc)
                 if amp_dtype is None:
-                    mm = self.decode(z[i:i + chunk], c)
+                    mm = self.decode(z[i:i + chunk], c, pc)
                 else:
                     with torch.autocast(self.device.type, dtype=amp_dtype):
-                        mm = self.decode(z[i:i + chunk], c)
+                        mm = self.decode(z[i:i + chunk], c, pc)
                 outs.append(mm.float()); ws.append(self.weights(c, z[i:i + chunk]))
             return torch.cat(outs), torch.cat(ws), pr

@@ -352,11 +352,25 @@ class ATMBundle(torch.nn.Module):
         if a.shape[0] == 1:
             a = a.expand(n, -1)                            # D3
         assert a.shape == (n, ANATOMICAL_DIM), a.shape
-        s = self.net.ae.decode(z, a)                       # [N,3,128], tanh -> [-1,1]
-        assert s.shape == (n, 3, N_POINTS), s.shape
-        mm = (s.permute(0, 2, 1) + 1.0) * self.coord_scale + self.coord_min   # D5
+        raw = self.decode_raw(z, a)
+        mm = (raw + 1.0) * self.coord_scale + self.coord_min   # D5
         assert mm.shape == (n, N_POINTS, 3)
         return mm
+
+    def decode_raw(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """정규화 전 디코더 출력 [N,128,3], tanh 라 [-1,1].
+
+        좌표 역정규화를 분리한 이유: 전역 뇌 박스 하나로 3,321 쌍을 다 덮으면
+        실측상 pair 실제 범위의 **28배 부피**(선형 3.0배)를 tanh 한 구간에 욱여넣게 된다
+        (upstream 은 번들마다 supp/{bundle}_{min,max}_coords_*.npy 로 박스를 따로 뒀다).
+        pair 앵커 재매개화(roi_atm.PairAnchor)가 이 출력을 받아 다른 상수로 되돌린다.
+        """
+        n = z.shape[0]
+        if a.shape[0] == 1:
+            a = a.expand(n, -1)
+        s = self.net.ae.decode(z, a)                       # [N,3,128], tanh -> [-1,1]
+        assert s.shape == (n, 3, N_POINTS), s.shape
+        return s.permute(0, 2, 1)
 
     def encode_streamline(self, mm: torch.Tensor, a: torch.Tensor):
         """GT streamline [N,128,3] (mm) -> (mu, logvar). L_stream 용."""

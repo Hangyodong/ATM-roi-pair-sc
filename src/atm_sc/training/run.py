@@ -325,7 +325,7 @@ def _recon_rmse(model, data, batch: int = 2048) -> float:
             pr = P[i:i + batch].to(model.device)
             c = model.condition(feat, pr)
             mu, _ = model.encode_streamlines(s, c)
-            rec = model.decode(mu, c)
+            rec = model.decode(mu, c, pr)
             assert rec.shape == s.shape, (rec.shape, s.shape)
             assert torch.isfinite(rec).all(), "복원에 NaN/Inf"
             tot += float(((rec - s) ** 2).sum(-1).sum())
@@ -400,7 +400,9 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
     model = ROIPairATM(n_roi=n_roi, init_bundle=init_bundle, device=device, trainable=trainable,
                        unet_level=unet_level, in_channels=in_channels, template=template,
                        count_local_dim=int(getattr(cfg, "count_local_dim", 0)),
-                       cond_local_dim=int(getattr(cfg, "cond_local_dim", 0)))
+                       cond_local_dim=int(getattr(cfg, "cond_local_dim", 0)),
+                       pair_anchor=getattr(cfg, "pair_anchor", None),
+                       anchor_alpha=float(getattr(cfg, "anchor_alpha", 0.0)))
     unet_level = model.unet_level
     start_step, opt_state, rng_state = 0, None, None
     if resume is not None:
@@ -467,6 +469,9 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                     "count_local_dim": (model.count_head.local_dim
                                        if model.count_head is not None else 0),
                     "cond_local_dim": model.pair_emb.local_dim,
+                    "pair_anchor": bool(model.anchor is not None),
+                    "anchor_alpha": (float(model.anchor.alpha)
+                                     if model.anchor is not None else 0.0),
                     "t1_source": t1_source},           # 평가/추론이 같은 입력 프로토콜을 쓰게 한다
                    out_dir / name)
 

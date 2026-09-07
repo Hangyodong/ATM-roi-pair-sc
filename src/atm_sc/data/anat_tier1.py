@@ -53,7 +53,18 @@ def build_subject(sub: str, labels: np.ndarray, aff: np.ndarray, source: str = "
     assert t1.max() > 0 and wm.max() > 0, f"{sub}: T1 또는 WM 이 전부 0"
     assert 0.0 <= wm.min() and wm.max() <= 1.0 + 1e-5, f"{sub}: WM 이 확률이 아니다"
 
-    ijk = np.stack(np.nonzero(np.ones_like(labels, bool)), 1) if False else None  # (미사용)
+    # ── 강도 정규화 (필수) ─────────────────────────────────────────────────────
+    # 캐시의 rigid T1 은 **raw 강도**다. 실측 40명: 뇌 내부 중앙값이 163 ~ 63,824 (390배,
+    # subject 간 CV 1.635). 이건 스캐너/프로토콜 스케일이지 해부가 아니다. 정규화 없이
+    # t1_mean 같은 값을 쓰면 ridge 가 해부 대신 **획득 조건**을 학습하고, 사이트 효과가
+    # SC 와 상관되면 가짜 양성이 나온다. 뇌 내부 중앙값으로 나눠 상대 대비만 남긴다.
+    # 스케일 자체는 버리지 않고 t1_scale 로 따로 남겨 교란변수로 검사할 수 있게 한다.
+    brain = t1 > (0.05 * float(t1.max()))
+    assert brain.sum() > 1e5, f"{sub}: 뇌 마스크가 {int(brain.sum())} voxel 뿐이다"
+    scale = float(np.median(t1[brain]))
+    assert scale > 0, f"{sub}: 뇌 내부 중앙 강도가 0"
+    t1 = t1 / scale
+
     out = {k: np.zeros(N_ROI, np.float32) for k in
            ("t1_sum", "t1_mean", "t1_std", "wm_sum", "wm_mean", "shell_t1_mean", "n_vox")}
     cent = np.zeros((N_ROI, 3), np.float32)
@@ -77,11 +88,11 @@ def build_subject(sub: str, labels: np.ndarray, aff: np.ndarray, source: str = "
         c_vox = (idx * w[:, None]).sum(0) / w.sum()
         cent[i] = (aff[:3, :3] @ c_vox + aff[:3, 3]).astype(np.float32)
 
-    brain = t1 > (0.05 * float(t1.max()))
     return {**out, "centroid": cent,
             "brain_vol": np.float32(brain.sum()),
             "t1_total": np.float32(t1.sum()),
             "wm_total": np.float32(wm.sum()),
+            "t1_scale": np.float32(scale),      # 교란변수 (스캐너 강도 스케일). feature 가 아니다
             "sub": np.array(sub)}
 
 
