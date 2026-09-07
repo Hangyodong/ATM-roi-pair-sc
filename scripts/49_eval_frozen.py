@@ -284,7 +284,7 @@ def evaluate_subject(m, sub, atlas, affine, a, dev):
             if rl is not None:
                 out["resid_log_sd"] = float(np.std(rl))
         sc_a, n_gen, S2 = generate_by_count(m, feat, pairs, nall, atlas, affine, subj.n_roi,
-                                            keep=a.trk, bank=a.bank)
+                                            keep=a.trk, bank=a.bank, local_roi=roi)
         if a.bank is not None:
             out["alloc_bank_hit"] = float(sc_a.get("bank_hit", 0.0))
         out["alloc"] = {"all": sc_metrics_extended(torch.as_tensor(sc_a["pass"]["sc"], dtype=torch.float32), gt)}

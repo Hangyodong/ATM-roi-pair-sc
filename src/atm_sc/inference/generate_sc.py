@@ -182,7 +182,7 @@ def template_counts(template_end: np.ndarray, pairs: np.ndarray, total: int,
 
 @torch.no_grad()
 def generate_by_count(model, anatomy, pairs: np.ndarray, counts: np.ndarray, atlas, affine, n_roi: int,
-                      batch: int = 20000, seed: int = 0, keep: bool = False, bank=None):
+                      batch: int = 20000, seed: int = 0, keep: bool = False, bank=None, local_roi=None):
     """pair 별 counts 만큼 생성하고 SC 를 누적한다 (전부 메모리에 올리지 않는다).
 
     bank (inference.latent_bank.LatentBank) 를 주면 사전분포 대신 거기서 latent 를 뽑는다.
@@ -209,7 +209,7 @@ def generate_by_count(model, anatomy, pairs: np.ndarray, counts: np.ndarray, atl
             if hit.any():
                 z = torch.where(torch.as_tensor(hit, device=model.device)[:, None],
                                 torch.as_tensor(zb, device=model.device), z)
-        S, w, _ = model.generate(anatomy, P, 1, generator=g, z=z)
+        S, w, _ = model.generate(anatomy, P, 1, generator=g, z=z, local_roi=local_roi)
         S = S.cpu().numpy().astype(np.float32)
         npts = np.full(len(S), S.shape[1], np.int64)
         for mode in ("pass", "end"):

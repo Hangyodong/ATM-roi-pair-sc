@@ -92,7 +92,13 @@ def selfcheck(built: dict, device: str) -> dict:
     P = torch.as_tensor(np.repeat(pid[k][None], S.shape[0], 0).astype(np.int64), device=device)
 
     with torch.no_grad():
-        c0, ca = m0.condition(a, P), ma.condition(a, P)
+        # cond FiLM 국소 통로(cond_local_dim)가 checkpoint 에서 상속되면 condition 은 local 이 필수다
+        loc = None
+        if m0.pair_emb.local_dim:
+            from atm_sc.data.local_feats import load_roi_feats, pair_local
+            from atm_sc.models.roi_pair_embedding import canonical_pairs
+            loc = pair_local(load_roi_feats(sub, built["t1_source"], device, n_roi=m0.n_roi), canonical_pairs(P))
+        c0, ca = m0.condition(a, P, local=loc), ma.condition(a, P, local=loc)
         mu0, _ = m0.encode_streamlines(S, c0)
         r0 = m0.decode(mu0, c0)
         ra = ma.decode(mu0, ca, P)

@@ -10,13 +10,13 @@
 phase: d3_joint
 subjects: outputs/splits/train.txt
 max_steps: 1000
-out_dir: outputs/checkpoints/retrain/j1_joint
+out_dir: outputs/checkpoints/retrain/j1_joint_noanchor
 trainable: vae
 unet_level: none          # 인코더(E8)는 고정. 22.4M 을 다시 흔들면 그 위 전부가 또 낡는다
 t1_source: rigid
 in_channels: 2
 template: true
-resume: outputs/checkpoints/retrain/a3_aux/a3_aux_step2000.pt
+resume: outputs/checkpoints/retrain/df_prior/d3_joint_step2000.pt  # D-f''' (A3 head 포함). D4 앵커는 recon 25.8mm 로 게이트 미달 -> 폐기
 log_every: 50
 save_every: 500
 
@@ -43,7 +43,7 @@ train:
   resid_beta: 1.0
   resid_stats: outputs/cache/sc_template_stats.npz
   tier1_stats: outputs/cache/anat_tier1_pair_stats.npz
-  anchor_alpha: 1.0       # D4 checkpoint 면 앵커 완전 적용 (구조는 상속). A3 면 무시된다
+  anchor_alpha: 0.0       # 앵커 없음 (D4 폐기)
 
 loss:
   recon: 1.0
