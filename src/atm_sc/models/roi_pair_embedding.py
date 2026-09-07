@@ -28,7 +28,7 @@ def canonical_pairs(pairs: torch.Tensor) -> torch.Tensor:
 class ROIPairEmbedding(nn.Module):
     def __init__(self, n_roi: int, emb_dim: int = 64, cond_dim: int = 512, hidden: int = 256,
                  latent_dim: int = 64, n_modes: int = 2, prior_use_anatomy: bool = False,
-                 local_dim: int = 0):
+                 local_dim: int = 0, prior_local_dim: int = 0):
         super().__init__()
         self.n_roi, self.emb_dim, self.cond_dim = n_roi, emb_dim, cond_dim
         self.emb = nn.Embedding(n_roi, emb_dim)
@@ -89,6 +89,18 @@ class ROIPairEmbedding(nn.Module):
         # 16.9%, W2-b subject_ceiling)을 **원리적으로** 못 맞춘다. 0-init 이라 켜도 시작 시점은
         # 기존 체크포인트와 bit-exact 동일하다. 꺼져 있으면 forward 에 들어가지 않아 grad 가
         # None 이고 optimizer 가 건드리지도 않는다.
+        # D-f: **pair 의존** subject 조건부 prior. 기존 prior_anatomy 는 Linear(cond_dim -> 2D)
+        # 라 출력이 pair 와 무관해서 subject 잔차의 3.8% 만 표현할 수 있었다 (W4-a 구조 제약).
+        # 여기는 pair 별 국소 anatomy 와 pair 벡터를 함께 받아 나머지 96.2% 를 겨냥한다.
+        # 지도는 이미 있다 -- trainer 의 prior 적합항이 mu 를 GT posterior 평균으로 회귀시킨다.
+        # 0-init 이라 켜도 시작은 bit-exact.
+        self.prior_local_dim = int(prior_local_dim)
+        self.prior_local = None
+        if self.prior_local_dim:
+            self.prior_local = nn.Sequential(
+                nn.Linear(self.prior_local_dim + emb_dim, hidden), nn.GELU(),
+                nn.Linear(hidden, 2 * latent_dim))
+            nn.init.zeros_(self.prior_local[-1].weight); nn.init.zeros_(self.prior_local[-1].bias)
         self.prior_use_anatomy = bool(prior_use_anatomy)
         self.prior_anatomy = nn.Linear(cond_dim, 2 * latent_dim)
         nn.init.zeros_(self.prior_anatomy.weight); nn.init.zeros_(self.prior_anatomy.bias)
@@ -109,7 +121,8 @@ class ROIPairEmbedding(nn.Module):
             return mode.long().to(device)
         return torch.full((n,), int(mode), dtype=torch.long, device=device)
 
-    def prior_params(self, pairs: torch.Tensor, mode=0, anatomy: torch.Tensor | None = None):
+    def prior_params(self, pairs: torch.Tensor, mode=0, anatomy: torch.Tensor | None = None,
+                     local: torch.Tensor | None = None):
         """[N,2] -> (mu [N,D], log_sigma [N,D]).  p(z | pair) = N(mu, diag(exp(2*log_sigma))).
 
         log_sigma 는 전부 0-init 이므로 학습 전에는 sigma == 1.0 이고 `mu + sigma*eps` 가
@@ -129,6 +142,15 @@ class ROIPairEmbedding(nn.Module):
             ls = ls + d[:, self.latent_dim:]
         else:
             assert not self.prior_use_anatomy, "prior_use_anatomy=True 인데 anatomy 가 없다"
+        if self.prior_local is not None:
+            assert local is not None, "prior_local_dim > 0 인데 local feature 가 안 넘어왔다"
+            assert local.shape == (pairs.shape[0], self.prior_local_dim), (
+                local.shape, pairs.shape[0], self.prior_local_dim)
+            dl = self.prior_local(torch.cat([local, v], dim=-1))
+            mu = mu + dl[:, :self.latent_dim]
+            ls = ls + dl[:, self.latent_dim:]
+        else:
+            assert local is None, "prior_local_dim = 0 인데 local feature 가 넘어왔다"
         lo, hi = self.prior_log_sigma_range
         return mu, ls.clamp(lo, hi)
 
@@ -143,12 +165,12 @@ class ROIPairEmbedding(nn.Module):
 
     def sample_prior(self, pairs: torch.Tensor, mode=0, anatomy=None,
                      generator: torch.Generator | None = None,
-                     eps: torch.Tensor | None = None) -> torch.Tensor:
+                     eps: torch.Tensor | None = None, local: torch.Tensor | None = None) -> torch.Tensor:
         """z ~ N(mu_pair, diag(sigma^2)).  eps 를 주면 재사용(재현/비교용).
 
         0-init 에서 `mu + exp(0)*eps == mu + eps` 라 기존 `roi_atm.sample_z` 와 bit-exact 같다.
         """
-        mu, ls = self.prior_params(pairs, mode, anatomy)
+        mu, ls = self.prior_params(pairs, mode, anatomy, local)
         if eps is None:
             eps = torch.randn(mu.shape, device=mu.device, dtype=mu.dtype, generator=generator)
         assert eps.shape == mu.shape, (eps.shape, mu.shape)

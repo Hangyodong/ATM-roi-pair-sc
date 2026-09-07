@@ -87,6 +87,7 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
     kw.setdefault("count_local_dim", int(sd.get("count_local_dim", 0)))
     kw.setdefault("cond_local_dim", int(sd.get("cond_local_dim", 0)))
     kw.setdefault("count_tier1_dim", int(sd.get("count_tier1_dim", 0)))
+    kw.setdefault("prior_local_dim", int(sd.get("prior_local_dim", 0)))
     if sd.get("pair_anchor"):
         kw.setdefault("pair_anchor", sd["pair_anchor"])
         kw.setdefault("anchor_alpha", float(sd.get("anchor_alpha", 0.0)))
@@ -109,7 +110,7 @@ class ROIPairATM(nn.Module):
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
                  count_local_dim: int = 0, cond_local_dim: int = 0,
                  pair_anchor: str | bool | None = None, anchor_alpha: float = 0.0,
-                 count_tier1_dim: int = 0):
+                 count_tier1_dim: int = 0, prior_local_dim: int = 0):
         """trainable: 'decoder' | 'vae' | 'vae+unet4' | 'full'.
         unet_level: 'none' | 'stage4' | 'stage3' | 'stage2' | 'full'. 주면 trainable 의 UNet 부분을 덮어쓴다.
         'full' = VAE 인코더/디코더 + UNet 전체 + heads (최종 전략 §2).
@@ -136,7 +137,8 @@ class ROIPairATM(nn.Module):
         self.unet_level = unet_level
         self.pair_emb = ROIPairEmbedding(n_roi, emb_dim, ANATOMICAL_DIM, latent_dim=LATENT_DIM,
                                          prior_use_anatomy=prior_use_anatomy,
-                                         local_dim=int(cond_local_dim)).to(self.device)
+                                         local_dim=int(cond_local_dim),
+                                         prior_local_dim=int(prior_local_dim)).to(self.device)
         # pair 앵커 재매개화 (models/pair_anchor.py). 전역 박스가 실제 pair 범위의 28배 부피라
         # z/prior 가 "뇌 어디쯤"까지 떠안고 있다. alpha=0 이면 기존 동작과 bit-exact 다.
         self.anchor = None
@@ -374,9 +376,12 @@ class ROIPairATM(nn.Module):
     def prior_mean(self, pairs: torch.Tensor, mode=0) -> torch.Tensor:
         return self.pair_emb.prior_mean(canonical_pairs(pairs), mode)
 
-    def prior_params(self, pairs: torch.Tensor, mode=0, anatomy: torch.Tensor | None = None):
-        """(mu [N,D], log_sigma [N,D]) = p(z | pair[, anatomy]). log_sigma 0-init 이면 sigma == 1.0."""
-        return self.pair_emb.prior_params(canonical_pairs(pairs), mode, self._prior_anat(anatomy, pairs))
+    def prior_params(self, pairs: torch.Tensor, mode=0, anatomy: torch.Tensor | None = None,
+                     local: torch.Tensor | None = None):
+        """(mu [N,D], log_sigma [N,D]) = p(z | pair[, anatomy, local]). log_sigma 0-init 이면 sigma == 1.0.
+        local [N, D] 은 pair 별 국소 anatomy (D-f: pair 의존 subject 조건부 prior)."""
+        return self.pair_emb.prior_params(canonical_pairs(pairs), mode,
+                                          self._prior_anat(anatomy, pairs), local)
 
     def sample_eps(self, n: int, generator: torch.Generator | None = None) -> torch.Tensor:
         return torch.randn(n, LATENT_DIM, device=self.device, generator=generator)
@@ -397,7 +402,8 @@ class ROIPairATM(nn.Module):
         return anatomy
 
     def sample_z(self, pairs_or_n, generator: torch.Generator | None = None,
-                 anatomy: torch.Tensor | None = None) -> torch.Tensor:
+                 anatomy: torch.Tensor | None = None,
+                 local: torch.Tensor | None = None) -> torch.Tensor:
         """z ~ N(mu_pair, diag(sigma_pair^2)). 정수를 주면 (하위 호환) N(0, I).
 
         log_sigma 0-init 인 구 checkpoint 에서는 `mu + exp(0)*eps == mu + eps` 라 예전 경로와
@@ -408,7 +414,7 @@ class ROIPairATM(nn.Module):
             return self.sample_eps(pairs_or_n, generator)
         cp = canonical_pairs(pairs_or_n)
         return self.pair_emb.sample_prior(cp, anatomy=self._prior_anat(anatomy, cp),
-                                          generator=generator)
+                                          generator=generator, local=local)
 
     def generate(self, anatomy: torch.Tensor, pairs: torch.Tensor, n_per_pair: int,
                  chunk: int = 8192, generator=None, amp_dtype=None, z=None,
@@ -419,12 +425,17 @@ class ROIPairATM(nn.Module):
         z 를 주면 사전분포 대신 그것을 쓴다 (inference.latent_bank).
         local_roi [R, D] 는 pair_emb.local_dim > 0 일 때 필요하다 (subject 의 ROI 국소 anatomy).
         """
-        assert not (self.pair_emb.local_dim and local_roi is None), (
-            "cond 국소 통로가 켜져 있는데 local_roi 가 안 넘어왔다")
+        assert not ((self.pair_emb.local_dim or self.pair_emb.prior_local is not None)
+                    and local_roi is None), "국소 통로가 켜져 있는데 local_roi 가 안 넘어왔다"
         with torch.inference_mode():
             pr = canonical_pairs(pairs).repeat_interleave(n_per_pair, dim=0)
             if z is None:
-                z = self.sample_z(pr, generator, anatomy=anatomy)
+                pl = None
+                if self.pair_emb.prior_local is not None:
+                    from ..data.local_feats import pair_local
+                    assert local_roi is not None, "prior 국소 통로가 켜졌는데 local_roi 가 없다"
+                    pl = pair_local(local_roi, canonical_pairs(pr))
+                z = self.sample_z(pr, generator, anatomy=anatomy, local=pl)
             else:                       # latent bank 등 외부에서 준 latent
                 assert z.shape[0] == pr.shape[0], (z.shape, pr.shape)
                 z = torch.as_tensor(z, device=self.device, dtype=torch.float32)

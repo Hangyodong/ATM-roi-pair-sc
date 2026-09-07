@@ -114,6 +114,7 @@ class TrainConfig:
     count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
     cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
     count_tier1_dim: int = 0              # >0 이면 count head 가 티어 1 해부량(자로 잰 값)을 받는다
+    prior_local_dim: int = 0              # D-f: >0 이면 prior 가 **pair 의존** 국소 anatomy 를 받는다
     tier1_stats: str | None = None        # train 전용 표준화 통계 npz (data/anat_tier1.pair_stats)
     pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
     anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
@@ -249,6 +250,20 @@ class Trainer:
         self.ae_bns = [b for b in model.atm.net.ae.modules() if isinstance(b, torch.nn.BatchNorm1d)]
         assert self.ae_bns, "ConvVAE 에서 BatchNorm1d 를 하나도 못 찾았다 (구조가 바뀌었나?)"
 
+    def prior_local(self, sub: str, pairs: torch.Tensor) -> torch.Tensor | None:
+        """D-f: prior 통로용 pair 별 국소 anatomy. prior_local_dim = 0 이면 None."""
+        if self.model.pair_emb.prior_local is None:
+            return None
+        fr = self._roi_from_live()
+        if fr is None:
+            from ..data.local_feats import load_roi_feats
+            if sub not in self._local:
+                self._local[sub] = load_roi_feats(sub, self.cfg.local_source, self.device,
+                                                  n_roi=self.model.n_roi)
+            fr = self._local[sub]
+        from ..models.roi_pair_embedding import canonical_pairs as _cp
+        return L_local.pair_local(fr, _cp(pairs))
+
     def cond_local(self, sub: str, pairs: torch.Tensor) -> torch.Tensor | None:
         """디코더 조건용 [K, cond_local_dim]. cond_local_dim = 0 이면 None."""
         if not self.cfg.cond_local_dim:
@@ -375,7 +390,8 @@ class Trainer:
                 # 영역을 학습한다. log_sigma 0-init 이면 exp(0)=1 이라 기존 `prior_mean + eps` 와
                 # bit-exact 같다. sigma 는 detach 한다 -- 안 그러면 endpoint/SC 손실이 sigma 를
                 # 0 으로 붕괴시켜(결정적 z) 제약을 만족시키는 도피로가 생긴다.
-                mu_pc, ls_pc = m.prior_params(pc, anatomy=a_leaf)
+                mu_pc, ls_pc = m.prior_params(pc, anatomy=a_leaf,
+                                              local=self.prior_local(subject.sub, pc))
                 zc = mu_pc + torch.exp(ls_pc.detach()) * eps[i:i + cfg.chunk]
                 if cfg.amp_dtype is None:
                     S = m.decode(zc, c, pc)
@@ -519,7 +535,8 @@ class Trainer:
             mu, logvar = m.encode_streamlines(S_gt, c)
             rec = m.decode(m.reparameterize(mu, logvar), c, P_gt)
             l_rec = L.stream_recon_loss(rec, S_gt, weights=rw)
-            mu_p, ls_p = m.prior_params(P_gt, anatomy=a_leaf)
+            mu_p, ls_p = m.prior_params(P_gt, anatomy=a_leaf,
+                                        local=self.prior_local(subject.sub, P_gt))
             # KL 은 prior 를 **고정 목표**로만 쓴다 (detach). C11 참조.
             l_kl = L.kl_loss(mu, logvar, mu_p.detach(), 2.0 * ls_p.detach())
             l_geom = L.adjacency_loss(rec)
@@ -576,7 +593,8 @@ class Trainer:
             mu, logvar = m.encode_streamlines(S_sg, c)
             rec = m.decode(m.reparameterize(mu, logvar), c, P_sg)
             l_sr = L.stream_recon_loss(rec, S_sg)
-            mu_ps, ls_ps = m.prior_params(P_sg, mode=1, anatomy=a_leaf)
+            mu_ps, ls_ps = m.prior_params(P_sg, mode=1, anatomy=a_leaf,
+                                          local=self.prior_local(subject.sub, P_sg))
             l_sk = L.kl_loss(mu, logvar, mu_ps.detach(), 2.0 * ls_ps.detach())
             l_sg = L.adjacency_loss(rec)
             tot_s = w.seg_recon * l_sr + w.seg_kl * l_sk + w.seg_geom * l_sg

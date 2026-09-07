@@ -402,6 +402,7 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                        count_local_dim=int(getattr(cfg, "count_local_dim", 0)),
                        cond_local_dim=int(getattr(cfg, "cond_local_dim", 0)),
                        count_tier1_dim=int(getattr(cfg, "count_tier1_dim", 0)),
+                       prior_local_dim=int(getattr(cfg, "prior_local_dim", 0)),
                        pair_anchor=getattr(cfg, "pair_anchor", None),
                        anchor_alpha=float(getattr(cfg, "anchor_alpha", 0.0)))
     unet_level = model.unet_level
@@ -470,6 +471,7 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                     "count_local_dim": (model.count_head.local_dim
                                        if model.count_head is not None else 0),
                     "cond_local_dim": model.pair_emb.local_dim,
+                    "prior_local_dim": model.pair_emb.prior_local_dim,
                     "count_tier1_dim": (model.count_head.tier1_dim
                                        if model.count_head is not None else 0),
                     "pair_anchor": bool(model.anchor is not None),
