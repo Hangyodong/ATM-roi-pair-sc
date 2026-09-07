@@ -1,0 +1,31 @@
+phase: endpoint
+subjects: outputs/splits/train.txt
+max_steps: 3000
+out_dir: outputs/checkpoints/phase4_endpoint
+trainable: full
+unet_level: full
+resume: outputs/checkpoints/phase3_t1_encoder/t1_encoder_step3000.pt
+log_every: 50
+train:
+  sc_mode: pass
+  n_gen_per_pair: 4
+  max_pairs_per_step: 256
+  chunk: 4096
+  endpoint_tau: 5.0
+  lr_t1: 1.0e-05
+  lr_vae_enc: 3.0e-05
+  lr_dec: 3.0e-05
+  lr_heads: 0.0001
+  grad_clip: 50.0
+  seed: 0
+  gt_pairs_per_step: 128
+loss:
+  recon: 1.0
+  kl: 0.1
+  geom: 1.0
+  endpoint: 1.0
+  edge: 0.5
+  corr: 0.5
+  mag: 0.5
+  length: 0.2
+save_every: 200

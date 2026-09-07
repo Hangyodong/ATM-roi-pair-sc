@@ -1,0 +1,117 @@
+# 재학습 파이프라인 (docs/PIPELINE_08_RETRAIN_DESIGN.md).
+# 전처리 프로토콜: rigid MNI152 정합 + [0,1] 정규화 + WM 2채널.
+# 사전 조건: scripts/37 (rigid T1) · scripts/36 (WM) · scripts/34 (템플릿+bank) 완료.
+phases:
+- configs/retrain/p0_warmup.yaml
+- configs/retrain/p1_route.yaml
+- configs/retrain/p2_count.yaml
+- configs/retrain/p3_mag.yaml
+- configs/retrain/p4_joint.yaml
+state_file: outputs/checkpoints/retrain/pipeline_state.json
+lock_file: outputs/checkpoints/retrain/pipeline.lock
+preempt_file: outputs/checkpoints/retrain/preempt
+val_subjects: outputs/splits/val.txt
+val_max_subjects: 3
+val_pairs_per_cell: 8
+val_n_per_pair: 16
+# 8 -> 31 (val split 전체). resid_r 관문(>=0.10) 은 n=8 에서 95% 구간 폭이 0.208 이라
+# 판정이 불가능했다 (val 0.1235 -> test -0.0107). 부트스트랩 근거: outputs/eval/s0b_gate_ci.json.
+# 비용은 indiv_sec 10초(8명) -> 40초 안팎, phase 2h10m 대비 무시할 수준.
+val_indiv_subjects: 31
+val_pair_dice: true
+val_dice_pairs: 30
+test_subjects: outputs/splits/test.txt
+final_eval: true
+
+# 개인차 지표를 학습 중에도 남긴다 (문제 C7). phase 끝 한 점(5 phase = 5점/15,000 step)으로는
+# 미학습과 평탄역을 구분할 수 없다. indiv_sec 이 10초라 500 step 간격이면 phase(2h10m) 대비 0.8%.
+# 출력은 val_metrics.jsonl 이 아니라 outputs/checkpoints/retrain/indiv_trace.jsonl 이다.
+indiv_log_every: 500
+
+# --- 관문 (docs/PIPELINE_08_RETRAIN_DESIGN.md §4 표) ------------------------------------------
+# 문서에만 있고 드라이버가 강제하지 않아 p1 의 route_f1 0.4956 (< 0.50) 이 그냥 통과했다.
+# 여기 적힌 것은 scripts/19_train_pipeline.py 가 phase 끝마다 실제로 강제한다 (미달 -> 종료 4).
+# min_n: 표본이 모자라면 값이 기준을 넘어도 통과가 아니다. p2 의 resid_r 0.1235 는 val 8명에서
+#   나왔고 test 31명에서는 -0.0107 이었다. 부트스트랩 실측(outputs/eval/s0b_gate_ci.json,
+#   `python scripts/40_gate_ci.py`): n=8 의 95% 구간 폭 0.208 (n=31 의 1.99배), 개인차가 0 인
+#   분포에서도 n=8 이면 3.4% 확률로 0.10 을 넘는다. 반폭 <= 0.05 (관문값의 절반) 에는 n=34 가
+#   필요하고 val split 이 31명이라 31 로 둔다 (n=31 반폭 0.052). -> val_indiv_subjects 도 31.
+# 지표가 없거나 NaN 이면 건너뛰지 않고 즉시 죽는다 (check_gates).
+# P0 의 recon RMSE <= 4.5mm 는 val 지표에 없다(학습 로그 전용) -> 여기에 걸 수 없다. 지우지 않고
+#   남겨 둔다: 넣으려면 validate() 가 recon RMSE 를 먼저 재야 한다.
+gates:
+  p0_warmup:
+  - &abl_gap
+    metric: abl_gap
+    op: '>'
+    value: 0.0
+    action: warn
+    note: >-
+      abl_gap = abl_own_r - abl_zero_r. 실측 p0/p1 = 정확히 0 (own/shuf/zero 가 16자리까지 동일 =
+      T1 입력이 출력에 준 영향 0), p2/p3/p4 = -0.0159/-0.0123/-0.0104 로 음수다 (T1 을 지운 쪽이
+      SC 상관이 더 좋다). own-shuf 도 1e-4 수준. 이 값이 0 이하면 어떤 다른 지표가 좋아도 개인
+      예측이 아니다. subject 별 own/zero 가 로그에 없어 CI 는 못 만든다 -- 부호로 판정한다.
+  p1_route:
+  - metric: route_f1
+    op: '>='
+    value: 0.50
+    n_key: n_val
+    min_n: 3
+    action: halt
+    note: >-
+      생성 경로의 route F1 (복원 경로 0.832 가 아니다, §4 관문 정정). 실측 p1 0.4956 -> 이후
+      9,000 step 동안 0.492~0.494 로 미동 없음: 미달은 미학습이 아니라 평탄역이다. step 을
+      늘려서 해결되지 않는다 -- 손실 설계/구조 문제로 다뤄라.
+  - metric: length_mm
+    op: '>='
+    value: 80.0
+    action: warn
+    note: 생성 길이 80~140mm (§4). 미달이면 gen_length 가중치 상향.
+  - metric: length_mm
+    op: <=
+    value: 140.0
+    action: warn
+    note: 생성 길이 상한. 초과면 gen_length / 길이 prior 재조정.
+  - *abl_gap
+  p2_count:
+  - metric: resid_r
+    op: '>='
+    value: 0.10
+    n_key: n_indiv_subj
+    min_n: 31
+    action: halt
+    note: >-
+      §4 P2 분기. n=8 로는 판정할 수 없다 (95% 구간 폭 0.208, 위양성 3.4%). val split 전체
+      31명에서 재고, 그래도 반폭은 0.052 다. 미달 시: 0.05~0.10 이면 쌍별 국소 anatomy(⑥) 추가
+      후 P2 재실행, 0.05 미만이면 중단하고 재현 파이프라인을 결과로 보고한다.
+  - metric: resid_r
+    op: '>='
+    value: 0.05
+    n_key: n_indiv_subj
+    min_n: 31
+    action: warn
+    note: 0.05~0.10 구간(신호는 있으나 약함) 을 halt 와 구분해 보이기 위한 표시용.
+  - *abl_gap
+  p3_mag:
+  - *abl_gap
+  p4_joint:
+  - metric: resid_r
+    op: '>='
+    value: 0.20
+    n_key: n_indiv_subj
+    min_n: 31
+    action: halt
+    note: §4 P4 목표. 실측 p4 val 8명 -0.0307, test 31명 -0.0107.
+  - metric: sc_pass_r_w_delta_prev
+    op: '>='
+    value: -0.02
+    n_key: n_val
+    min_n: 3
+    action: halt
+    note: >-
+      문서의 SC r >= 0.88 을 대체한다. 0.88 은 폐기된 그룹정보 주입 구성(--use-bank + 템플릿
+      배분)에서 나온 수치라 T1 단독 경로의 기준이 될 수 없다. T1 단독 generated 경로 현재값:
+      test 31명 pass-SC r 0.713 (r_log 0.678, CCC 0.058), val sc_pass_r_w p3 0.7103 -> p4 0.7071.
+      절대 기준을 자의로 정하지 않고 직전 phase 대비 하락(-0.02 초과)만 막는다. 그룹 템플릿
+      기준선 0.945 는 비교용이지 관문이 아니다.
+  - *abl_gap

@@ -1,0 +1,80 @@
+# P1 경로/끝점 — route + endpoint + edge 를 켠다.
+# 관문: route_f1 >= 0.75, 생성 길이 80~140 mm
+phase: p1_route
+subjects: outputs/splits/train.txt
+max_steps: 3000
+out_dir: outputs/checkpoints/retrain/p1_route
+trainable: full
+unet_level: full
+t1_source: rigid
+in_channels: 2
+template: true
+resume: outputs/checkpoints/retrain/p0_warmup/p0_warmup_step3000.pt
+log_every: 10
+save_every: 200
+train:
+  sc_mode: pass
+  n_gen_per_pair: 8
+  max_pairs_per_step: null
+  chunk: 2048
+  endpoint_tau: 5.0
+  lr_t1: 1.0e-05
+  lr_vae_enc: 3.0e-05
+  lr_dec: 3.0e-05
+  lr_heads: 0.0001
+  grad_clip: 50.0
+  seed: 0
+  gt_pairs_per_step: 128
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  route_tau: 1.0
+  route_mode: bce
+  route_pos_weight: 2.0
+  presence_scale: 1.0
+  presence_blocks:
+  - sub-sub
+  sc_global_weight: 0.5
+  sc_groups: block
+  weight_mode: count
+  balance:
+    enabled: true
+    alpha: 0.5
+    b_base: 100.0
+    b_min: 16.0
+    b_max: 256.0
+    real_fraction_min: 0.5
+    max_synthetic_ratio: 4.0
+    min_seed_count: 20
+    lambda_syn: 0.5
+  seg_edges_per_step: 48
+  n_seg_per_edge: 8
+  segment_balance:
+    enabled: true
+    alpha: 0.5
+    b_base: 100.0
+    b_min: 16.0
+    b_max: 256.0
+    n_points: 128
+    min_segments: 2
+    edge_sampling: target
+loss:
+  recon: 1.0
+  kl: 0.1
+  geom: 1.0
+  endpoint: 1.0
+  edge: 0.5
+  corr: 0.5
+  mag: 0.5
+  length: 0.2
+  route: 1.0
+  route_gen: 0.5
+  presence: 0.5
+  seg_recon: 1.0
+  seg_kl: 0.1
+  seg_geom: 1.0
+  seg_endpoint: 0.5
+  count: 1.0
+  gen_length: 1.0
+  scale: 1.0
+  rmse: 0.2

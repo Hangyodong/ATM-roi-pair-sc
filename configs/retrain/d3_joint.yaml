@@ -1,0 +1,162 @@
+# D3 joint — 복원 + 생성 제약 + 조건부 prior 를 **동시에** (W3-a)
+#
+# 왜 joint 인가
+# ------------
+# D1 이 복원만 6,000 step 돌려 디코더를 고쳤다 (eval recon 7.721 -> 2.240 mm, 오라클 pair dice
+# 0.328 -> 0.590). 그런데 **생성 경로가 무너졌다** (C13):
+#     valid_conn      0.367 -> 0.042
+#     endpoint_in_roi 0.745 -> 0.555
+#     생성 pair dice  0.095 -> 0.073
+# 원인은 posterior drift 가 아니다 (w2a_latent_drift.json: prior_mean 대비 오프셋이 5.27 -> 3.51
+# 로 오히려 줄었다). recon 전용 학습이 생성 제약을 전부 떼어낸 채 디코더만 날카롭게 만들어서
+# **prior 가 뽑는 영역이 더 이상 디코더가 정확한 영역이 아니게 된 것**이다.
+# 이 프로젝트는 순차 단계 학습이 앞 성과를 깎는 실패를 반복했다 (p2->p3->p4 에서 resid_r
+# 0.124 -> 0.009 -> -0.031). 그래서 phase 를 나누지 않고 한 번에 돈다.
+#
+# 조건부 prior (W2-b patch 를 학습 경로에 연결)
+# ---------------------------------------------
+#   * KL 에 들어가는 prior 파라미터는 **detach** 한다. KL(q||p) 의 p 최적해는 aggregate posterior
+#     의 모멘트라 평균이 mu_pair 에 묶인 지금 구조에서 sigma* = 1.074 -- 즉 지금의 1.0 이 이미
+#     KL 최적점이고 그 sigma 로 채점하면 precision 36.61 -> 38.74 로 **나빠진다** (C11 실측).
+#   * prior 는 별도 적합항으로 학습한다: L_prior = -log N(mu_q.detach(); mu_p, sigma_p).
+#     이 항의 최소해가 곧 채점에서 15.60 이 나온 arch_additive 적합이다 (w2b_prior_ladder.json).
+#   * K-혼합은 일반화 수준에서 15.60 -> 14.40 밖에 안 붙어 쓰지 않는다. prior_use_anatomy 도 끈다.
+#   * 생성 경로 z 도 추론(`roi_atm.sample_z`)과 같은 분포에서 뽑는다 (sigma detach:
+#     endpoint/SC 손실이 sigma 를 0 으로 붕괴시키는 도피로를 막는다).
+#
+# 왜 UNet 동결인가: anatomy 경로 기여가 0 이라는 것이 통제 실험으로 확인됐고(own=shuf=zero,
+# ROI 국소 풀링 0.063 < 전뇌 0.068 < 뇌 부피 0.102), UNet forward 가 학습 비용의 대부분이다.
+#
+# 왜 bn_mode: eval 인가 (recal_eval 이 아니라)
+# --------------------------------------------
+# D1 은 step 0 에서 p4_joint 가중치로 running 통계를 재보정한 뒤 BN 을 eval 로 고정하고 6,000
+# step 을 돌았다. 즉 지금의 디코더 가중치는 **그 통계에 맞춰 적응한 것**이다. 여기서 다시
+# 재보정하면 함수가 바뀌어 2.240 mm 출발점을 스스로 깎는다. 통계를 그대로 얼려 이어받는다.
+phase: d3_joint
+subjects: outputs/splits/train.txt
+max_steps: 3000
+out_dir: outputs/checkpoints/retrain/d3_joint
+trainable: vae            # VAE 인코더 + 디코더 + (항상 포함되는) heads. UNet 은 건드리지 않는다.
+unet_level: none          # UNet 동결 -> anatomy 는 디스크 캐시.
+t1_source: rigid
+in_channels: 2
+template: true
+resume: outputs/checkpoints/retrain/d1_decoder/d1_decoder_step6000.pt
+log_every: 10
+save_every: 250
+
+train:
+  bn_mode: eval           # D1 이 남긴 running 통계를 그대로 얼린다 (위 설명).
+  sc_mode: pass
+  n_gen_per_pair: 8
+  max_pairs_per_step: null
+  chunk: 2048
+  endpoint_tau: 5.0
+  gt_pairs_per_step: 128
+  n_gt_per_pair: 8
+  # LR: p4_joint 와 같은 수준. D1 의 3e-5 를 그대로 쓰면 생성 제약이 붙는 순간 디코더가 크게
+  # 움직여 2.240 mm 를 잃는다.
+  lr_t1: 0.0
+  lr_vae_enc: 1.0e-05
+  lr_dec: 1.0e-05
+  lr_heads: 3.3333333333333335e-05
+  # prior 분산 전용 LR (10배). Adam 은 손실 가중치가 아니라 LR 로 보폭이 정해져서, lr_heads
+  # 로는 log_sigma 가 1.25e-4/step 밖에 못 움직인다 (20 step 실측) -- 목표 log_sigma ~ -0.63
+  # (arch_additive 의 pred_log_sigma, 잔차 rms 0.53) 까지 4,800 step 이 필요하다는 뜻이다.
+  # 이 파라미터는 prior 적합항 하나로만 학습되므로(KL/생성 경로에서는 detach) 따로 올려도
+  # 다른 head 를 건드리지 않는다.
+  lr_prior: 3.0e-04
+  grad_clip: 50.0
+  seed: 0
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  route_tau: 1.0
+  route_mode: bce
+  route_pos_weight: 2.0
+  presence_scale: 1.0
+  presence_blocks:
+  - sub-sub
+  sc_global_weight: 0.5
+  sc_groups: block
+  weight_mode: count
+  balance:
+    enabled: true
+    alpha: 0.5
+    b_base: 100.0
+    b_min: 16.0
+    b_max: 256.0
+    real_fraction_min: 0.5
+    max_synthetic_ratio: 4.0
+    min_seed_count: 20
+    lambda_syn: 0.5
+  seg_edges_per_step: 48
+  n_seg_per_edge: 8
+  segment_balance:
+    enabled: true
+    alpha: 0.5
+    b_base: 100.0
+    b_min: 16.0
+    b_max: 256.0
+    n_points: 128
+    min_segments: 2
+    edge_sampling: target
+
+# p4_joint 와 같은 가중치에서 출발하고, 복원/생성 균형만 짧은 탐색(각 800 step)으로 정한다.
+# 탐색 근거는 outputs/eval/w3a_joint_result.json:sweep 에 남긴다.
+loss:
+  recon: 1.0
+  kl: 0.1
+  geom: 1.0
+  endpoint: 1.0
+  edge: 0.5
+  corr: 0.5
+  mag: 0.5
+  length: 0.2
+  route: 1.0
+  route_gen: 0.5
+  presence: 0.5
+  seg_recon: 1.0
+  seg_kl: 0.1
+  seg_geom: 1.0
+  seg_endpoint: 0.5
+  count: 1.0
+  gen_length: 1.0
+  scale: 1.0
+  rmse: 0.2
+  # prior 적합항. 64차원 합 로그우도라 값 자체는 크다(초기 ~65). 0.1 이면 posterior 평균 쪽으로
+  # 끌어당기는 힘이 KL(0.1) 과 같은 자릿수가 된다.
+  prior: 0.1
+  # segment(mode=1) prior 는 끈다: 추론 생성은 mode 0 만 쓰고(`roi_atm.generate`), 두 모드가
+  # 같은 prior_mu 선형사상을 공유해 서로 다른 목표로 당기면 mode 0 적합을 흐린다.
+  seg_prior: 0.0
+
+# configs/pipeline_retrain.yaml 의 gates 블록과 같은 형식.
+gates:
+  d3_joint:
+  - metric: recon_rmse_eval_mm
+    op: <=
+    value: 4.0
+    n_key: n_val
+    min_n: 3
+    action: halt
+    note: >-
+      D1 이 통과한 게이트를 joint 학습이 도로 깎지 않았는지. D1 출발점은 2.946 mm(val 3명) /
+      2.240 mm(test 31명 오라클 표본). 4.0 mm 는 W1-b 변위->dice 역표의 교집합 목표다.
+  - metric: valid_conn
+    op: '>='
+    value: 0.367
+    action: halt
+    note: >-
+      C13 회복 판정. p4_joint 가 0.367 이었고 D1 이 0.042 로 떨어뜨렸다. 이 값을 되찾지
+      못하면 joint 전략이 실패한 것이므로 그대로 보고한다.
+  - metric: gen_pair_dice
+    op: '>='
+    value: 0.0727
+    action: warn
+    note: D1 의 생성 pair dice. 오라클 0.590 이 천장이 아니라 목표선이다.
+  - metric: gen_wb_dice
+    op: '>='
+    value: 0.5832
+    action: warn
+    note: D1 의 생성 whole-brain dice.

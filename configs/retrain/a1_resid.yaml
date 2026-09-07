@@ -1,0 +1,62 @@
+# A1 잔차 타깃 — 개인차 축의 데이터 수준 가설을 검정하는 실험 (PIPELINE_12 §8-A)
+#
+# 무엇을 묻나
+# -----------
+# W4 프로브는 frozen feature 에 **선형** ridge 를 걸어 개인 신호가 r<0.02 라고 쟀다. 그건
+# "이 인코더 + 이 readout" 의 상한이지 "T1 에 정보가 없다" 가 아니다. 여기서는 supervision 을
+# 직접 건다: count head 를 SC 절대값이 아니라 **`SC - 그룹템플릿` 잔차**에 학습시킨다.
+#   * 그래도 val `resid_r` 이 0 이면  -> 데이터 주장이 비로소 근거를 갖는다.
+#   * 0 이 아니면                     -> 프로브 음성은 frozen 인코더/선형 readout 탓이었다.
+# 어느 쪽이든 지금 모르는 것을 알게 된다.
+#
+# 왜 count head 인가: 개인차의 소재가 *모양* 이 아니라 *세기* 다 (subject 성분 GT SC 카운트
+# 18.5% vs latent 조건평균 4.4%, `outputs/eval/w4a_prior_anatomy.json`).
+#
+# 왜 잔차 손실이 따로 필요한가: SC 분산의 89.3% 가 그룹 상수다 (템플릿 r 0.945). 절대값에
+# 손실을 걸면 기울기가 거의 전부 "템플릿 패턴을 더 잘 맞춰라" 로 간다 -- 실측으로 P2 에서
+# 0.124 였던 resid_r 이 P3 에서 corr/mag/scale 을 켜자 0.009 로 무너졌다.
+#
+# 구성: `a1_resid` phase 는 active={"count"} 하나다. 생성도 복원도 안 돌아 step 이 싸고,
+# 개인차 이외의 손실이 기울기를 가져가지 않는다. UNet 은 동결이라 anatomy 는 디스크 캐시
+# (= W4 프로브가 쓴 것과 같은 512-d). 즉 이 arm 이 검정하는 것은 **비선형 + 지도학습**
+# readout 이 선형 ridge 상한(0.101)을 넘느냐다.
+#
+# 판정: val 31명의 `resid_r` (outputs/eval/a1_resid_trace.jsonl). 기준값은 d3_joint_step3000 의
+# 0.023, 프로브 상한은 0.101 (그마저 머리 크기다).
+phase: a1_resid
+subjects: outputs/splits/train.txt
+max_steps: 3000
+out_dir: outputs/checkpoints/retrain/a1_resid
+trainable: vae            # 실제로 기울기가 가는 것은 count head 뿐 (active={"count"})
+unet_level: none          # UNet 동결 -> anatomy 는 디스크 캐시
+t1_source: rigid
+in_channels: 2
+template: true            # count head 템플릿 인수분해. 잔차 손실의 EMA 초기값이 여기서 온다
+resume: outputs/checkpoints/retrain/d3_joint/d3_joint_step3000.pt
+log_every: 50
+save_every: 500
+
+train:
+  bn_mode: eval
+  sc_mode: pass
+  max_pairs_per_step: null
+  chunk: 2048
+  lr_t1: 0.0
+  lr_vae_enc: 0.0         # 이 phase 는 head 만 움직인다
+  lr_dec: 0.0
+  lr_heads: 3.0e-04
+  grad_clip: 50.0
+  seed: 0
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  sc_groups: block
+  resid_momentum: 0.02
+  # 학습된 d3_joint 에서 이어받으므로 EMA 초기값(템플릿)과 현재 예측이 log1p 로 최대 3.39
+  # 벌어져 있다. EMA 는 warmup 중에도 갱신되므로 0.98^400 = 3.2e-4 -> 잔여 편향 0.0011 이다
+  # (허용 0.02, scripts/53_a1_resid.py 자기검증 (2)에서 산술로 확인한다).
+  resid_warmup: 400
+
+loss:
+  count: 1.0
+  resid: 1.0              # 대조군(arm C)은 이 값만 0 으로 바꾼다

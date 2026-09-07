@@ -1,0 +1,114 @@
+# D1 디코더 충실도 — 순수 복원만 (PIPELINE_11 §D1-d)
+#
+# 조건화도 SC 도 route 도 없다. 정답 streamline 을 넣고 정답을 복원한다.
+# 개인차·SC 는 이 단계의 관심사가 아니다 — 기하 하나만 본다.
+#
+# ── 이 phase 가 실제로 고치는 것: ConvVAE 의 BatchNorm train/eval 격차 (실측, W1-d) ──
+#
+#   같은 복원, 같은 가중치인데 렌즈에 따라 두 배 갈린다:
+#     train 모드 (배치 통계)      3.7~4.6 mm   <- trainer 가 로그에 찍어 온 값 (3.55/3.79 mm)
+#     eval  모드 (running 통계)   8.46 mm      <- 추론에서 실제로 나오는 값
+#   즉 **3.55 mm 는 추론 시점에 성립한 적이 없다.** p4_joint 는 recon/segment/생성 경로를
+#   같은 ConvVAE BN 에 통과시키므로 running 통계가 여러 분포의 평균이 되어 있다.
+#
+#   gradient 없이 running 통계만 다시 쌓으면 (BN 재보정, 파라미터 0 추가):
+#     eval 모드 8.458 -> **4.002 mm**  (val 3명, 오차의 53 %가 사라진다)
+#   recon 만으로 3,000 step 미세조정하면 (BN 은 train 모드로 두어 통계가 저절로 재보정됨):
+#     eval 모드 **3.08 mm** (base arm), LR 3배면 2.89 mm
+#
+#   W1-b 의 변위->dice 역표 기준 목표는 eval 모드 **4 mm** 다
+#   (whole-brain dice 0.614 -> <=5.78 mm, pair dice 0.3 -> <=4.16 mm, 교집합 약 4 mm).
+#   -> **BN 을 고치는 것만으로 목표를 통과한다. 디코더 용량 증설이 필요 없다.**
+#
+# 왜 UNet 을 동결하나: anatomy 경로의 기여가 0 이라는 것이 통제 실험으로 확인됐고
+# (abl_gap = own_r - zero_r 가 p0/p1 에서 정확히 0), UNet forward 가 학습 비용의 대부분이다.
+# unet_level: none -> run.py 가 디스크 캐시된 anatomy feature 를 쓰고 UNet 을 아예 안 돈다.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 이 config 를 돌리려면 아래 patch 가 먼저 들어가야 한다. 그 전에는 로드 단계에서 죽는다
+# (조용히 무시되지 않는다 — 그게 의도다). W1-d 는 trainer/run/config 편집 권한이 없어
+# 적용하지 않았다. patch 본문은 W1-d 보고 참조.
+#   P1  run.py      PHASES 에 "d1_decoder": {"recon"} 추가
+#   P2  trainer.py  TrainConfig.bn_mode + step() 의 m.train() 뒤 ConvVAE BN 을 eval 로 고정
+#   P3  run.py      학습 시작 시 BN 1회 재보정 (bn_mode == "recal_eval" 일 때)
+#   P4  run.py      validate() 가 eval 모드 recon RMSE 를 val 지표로 내보내야 아래 게이트가 동작
+#   (정련망을 켤 때만 추가로 필요: run() 에 use_refiner/refiner 인자 + ROIPairATM 전달 +
+#    checkpoint 메타 저장 + config.build() 반환. 지금은 use_refiner=false 라 불필요하다.)
+# ─────────────────────────────────────────────────────────────────────────────
+phase: d1_decoder
+subjects: outputs/splits/train.txt
+max_steps: 6000
+out_dir: outputs/checkpoints/retrain/d1_decoder
+trainable: vae            # VAE 인코더 + 디코더. UNet 은 건드리지 않는다.
+unet_level: none          # UNet 동결 -> anatomy 는 디스크 캐시. 학습 비용의 대부분이 사라진다.
+t1_source: rigid
+in_channels: 2
+template: true
+resume: outputs/checkpoints/retrain/p4_joint/p4_joint_step3000.pt
+log_every: 10
+save_every: 250
+
+# 디코더 정련망 (src/atm_sc/models/streamline_refiner.py) — **기본 off**.
+# BN 만 고쳐도 목표 4 mm 를 통과하므로 지금은 필요 없다 (용량 스윕에서 정련망의 추가 이득은
+# 0.2 mm 남짓이었다). 모듈은 0-init 스캐폴딩으로 남겨 둔다: 켜면 p4_joint checkpoint 와
+# bit-exact 동일한 상태에서 시작한다 (복원/생성 경로 max|diff| = 0, 실측).
+# 켤 때 권고 구성은 hidden 128 / layers 5 (수용영역 257점 > 128점, 911k 파라미터).
+use_refiner: false
+
+train:
+  # BN 취급. "recal_eval" = 시작 시 running 통계를 재보정하고 그 뒤 eval 로 고정한다.
+  # 그래야 학습과 추론이 같은 함수가 되고, 이번 같은 착시(3.55 vs 8.46)가 다시 안 생긴다.
+  #
+  # 스윕 실측(decoder_capacity.json, eval 열): bn_eval 2.883 / recal_eval 2.920 / base(train) 3.076.
+  # bn_eval 과의 0.037 mm 차이는 잡음 수준이고, recal_eval 은 **step 0 에서 이미 4.0 mm** 라
+  # 학습이 중간에 끊겨도 게이트가 성립한다 -> recal_eval 을 쓴다.
+  # W2-a 실행 결과 (6,000 step, train 144명, 510 s): held-out eval 8.755 -> **2.946 mm** (게이트 통과).
+  # test 31명 오라클 whole-brain 표본으로는 7.721 -> **2.240 mm**.
+  bn_mode: recal_eval
+  sc_mode: pass
+  n_gen_per_pair: 8
+  max_pairs_per_step: null
+  chunk: 2048
+  gt_pairs_per_step: 128  # 배치 = 128 pair x 8 가닥. 한 pair 다발이 아니라 128 pair 혼합이다.
+  n_gt_per_pair: 8
+  lr_t1: 0.0              # UNet 동결
+  lr_vae_enc: 3.0e-05
+  lr_dec: 3.0e-05         # 스윕에서 LR 3배(9e-5)가 2.89 mm 로 조금 나았으나 진동이 컸다
+  lr_heads: 0.0           # head 는 이 phase 의 손실에 연결되지 않는다
+  grad_clip: 50.0
+  seed: 0
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  # 순수 복원 단계에는 합성 streamline 이 필요 없다 (GT 를 넣고 GT 를 복원한다).
+  balance:
+    enabled: false
+
+loss:                     # 복원 3항만. 조건화·SC·route 손실 없음.
+  recon: 1.0
+  kl: 0.1
+  geom: 1.0
+
+# configs/pipeline_retrain.yaml 의 gates 블록과 같은 형식.
+# **반드시 eval 모드 기준**으로 건다 -- train 모드 값은 추론에서 성립하지 않는다는 것이
+# 이 phase 의 출발점이다. train 모드로 걸면 8.46 mm 짜리 모델이 3.55 로 통과한다.
+gates:
+  d1_decoder:
+  - metric: recon_rmse_eval_mm
+    op: <=
+    value: 4.0
+    n_key: n_val
+    min_n: 3
+    action: halt
+    note: >-
+      W1-b 변위->dice 역표의 교집합 목표. whole-brain dice 0.614(그룹 tractogram 초과선)에
+      <=5.78 mm, pair dice 0.3 에 <=4.16 mm 가 필요하다. 기준선: p4_joint 그대로가 8.46 mm,
+      BN 재보정만 해도 4.00 mm, recon 3,000 step 이면 3.08 mm. 이걸 못 넘으면 BN 처리가
+      실제로 적용되지 않은 것이므로 멈춘다.
+  - metric: recon_rmse_eval_mm
+    op: <=
+    value: 3.0
+    action: warn
+    note: >-
+      목표. 스윕 실측 3.08 mm (base) / 2.89 mm (LR 3배) 라 도달 가능한 범위다.
+      점 간격 1.24 mm / 아틀라스 복셀 2 mm 대비로는 아직 크다.

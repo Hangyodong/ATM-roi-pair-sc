@@ -1,0 +1,155 @@
+"""ROI-pair conditioning (pipeline §9).
+
+원본 ATM 은 bundle 마다 별도 모델이라 "bundle 조건" 이 곧 어느 .pth 를 쓰느냐였다.
+여기서는 하나의 decoder 를 공유하고 ROI pair 를 embedding 으로 조건화한다.
+
+주입 방식 (upstream 무수정):
+  ConvVAE 의 FiLM 층은 anatomical_info [N,512] 만 받는다 (model.py:296-298, 316-317).
+  따라서 cond = gain * LayerNorm(anatomy_feature) + Proj(Emb(a) + Emb(b)) 를 그 자리에 넣는다.
+  Proj 의 마지막 층은 0 초기화라 시작 시점 cond 는 anatomy 항뿐이다. LayerNorm 은 그 항의
+  크기를 pair 항과 맞추려고 새로 넣은 것이고(재학습 설계 §2 ②), pretrained decoder 가 보던
+  조건 분포가 바뀌므로 **P0 예열 단계가 필요하다** (좌표 박스 변경과 같은 전례).
+
+undirected 이므로 Emb(a) + Emb(b) (합) 으로 순서 불변성을 구조적으로 보장한다.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+def canonical_pairs(pairs: torch.Tensor) -> torch.Tensor:
+    """[N,2] -> (min, max)."""
+    assert pairs.ndim == 2 and pairs.shape[1] == 2, pairs.shape
+    pairs = pairs.long()                     # npz 는 int16 으로 저장, Embedding 은 long 필요
+    return torch.stack([pairs.min(dim=1).values, pairs.max(dim=1).values], dim=1)
+
+
+class ROIPairEmbedding(nn.Module):
+    def __init__(self, n_roi: int, emb_dim: int = 64, cond_dim: int = 512, hidden: int = 256,
+                 latent_dim: int = 64, n_modes: int = 2, prior_use_anatomy: bool = False):
+        super().__init__()
+        self.n_roi, self.emb_dim, self.cond_dim = n_roi, emb_dim, cond_dim
+        self.emb = nn.Embedding(n_roi, emb_dim)
+        nn.init.normal_(self.emb.weight, std=0.1)
+        self.proj = nn.Sequential(nn.Linear(emb_dim, hidden), nn.GELU(), nn.Linear(hidden, cond_dim))
+        nn.init.zeros_(self.proj[-1].weight)          # 시작 시 cond == anatomy 항만
+        nn.init.zeros_(self.proj[-1].bias)
+        # pretrained UNet 의 anatomy feature 는 |a| ~ 0.069 인데 pair_vec 은 1.521 로 22배 크다
+        # (실측, PIPELINE_06_FINDINGS.md). 그래서 optimizer 는 anatomy 대신 pair 임베딩만 쓰고
+        # T1 을 0 으로 바꿔도 SC 상관이 0.8108 -> 0.8067 밖에 안 변한다.
+        # LayerNorm 으로 subject 마다 크기를 고정하고(평균/분산 정규화) 가중치를 1/sqrt(C) 로
+        # 두어 LN 출력의 L2 를 1.0 으로 맞춘다 -- pair_vec(1.521) 과 같은 자릿수다 (재학습 설계 §2 ②).
+        # 이 스케일을 anatomy_gain 이 아니라 **새 파라미터**에 넣는 이유: 구 checkpoint 에는
+        # anatomy_norm 이 없어 missing-key 경로로 이 초기값이 그대로 살고, anatomy_gain(=1.0)
+        # 을 실어도 크기가 22배 튀지 않는다.
+        # eps 가 기본값(1e-5)이면 안 된다: anatomy 는 |a| ~ 0.069 / 512차원이라 원소 분산이
+        # 약 9e-6 으로 eps 와 같은 자릿수다 -> 정규화가 절반쯤 먹히고 크기 의존성이 남는다.
+        self.anatomy_norm = nn.LayerNorm(cond_dim, eps=1e-8)
+        nn.init.constant_(self.anatomy_norm.weight, cond_dim ** -0.5)
+        nn.init.zeros_(self.anatomy_norm.bias)
+        # 학습 가능한 스칼라 gain. LN 뒤라 이제 "pair 대비 몇 배로 들을지" 만 조절한다.
+        self.anatomy_gain = nn.Parameter(torch.ones(1))
+        # 조건부 prior p(z | pair) = N(mu_pair, I). pair 정보가 z 공간에 직접 들어간다.
+        # 근거: 같은 decoder 라도 z 를 GT posterior 은행에서 뽑으면 pair 정확도 0.66, N(0,I) 면 0.
+        # 즉 decoder 는 z 에 실린 pair 정보를 듣는다. 0-init -> 시작은 N(0,I).
+        self.latent_dim = latent_dim
+        self.prior_mu = nn.Linear(emb_dim, latent_dim)
+        nn.init.zeros_(self.prior_mu.weight); nn.init.zeros_(self.prior_mu.bias)
+        # prior 의 **분산도 pair 마다 학습한다**. 지금까지 I 로 고정돼 있었는데 실측은
+        # pair 안 GT latent sd 0.180 / prior sd 1.0 -> 차원당 5.6배 과대였다
+        # (outputs/eval/w1e_latent_modality.json:latent_geometry). 분산만 고쳐도 오라클
+        # precision_ratio 38.5 -> 7.3 (같은 파일 k_ladder).
+        # 0-init 라 sigma = exp(0) = 1.0 -> mu + 1.0*eps 는 기존 mu + eps 와 bit-exact 동일하다.
+        self.prior_log_sigma = nn.Linear(emb_dim, latent_dim)
+        nn.init.zeros_(self.prior_log_sigma.weight); nn.init.zeros_(self.prior_log_sigma.bias)
+        # 생성 단위 모드 (0 = full streamline, 1 = SC edge-aligned segment).
+        # 같은 decoder 로 두 가지를 만들되 조건에 모드를 더한다 (EDGE_ALIGNED 전략 §13-14 dual representation).
+        # 0-init -> 모드를 붙여도 시작 동작은 지금과 완전히 같다.
+        self.n_modes = n_modes
+        self.mode_emb = nn.Embedding(n_modes, cond_dim)
+        self.mode_prior = nn.Embedding(n_modes, latent_dim)
+        self.mode_log_sigma = nn.Embedding(n_modes, latent_dim)
+        nn.init.zeros_(self.mode_emb.weight); nn.init.zeros_(self.mode_prior.weight)
+        nn.init.zeros_(self.mode_log_sigma.weight)
+        # anatomy -> prior 통로. 이게 꺼져 있으면 z 는 pair 만 보므로 subject 성분(조건평균 분산의
+        # 16.9%, W2-b subject_ceiling)을 **원리적으로** 못 맞춘다. 0-init 이라 켜도 시작 시점은
+        # 기존 체크포인트와 bit-exact 동일하다. 꺼져 있으면 forward 에 들어가지 않아 grad 가
+        # None 이고 optimizer 가 건드리지도 않는다.
+        self.prior_use_anatomy = bool(prior_use_anatomy)
+        self.prior_anatomy = nn.Linear(cond_dim, 2 * latent_dim)
+        nn.init.zeros_(self.prior_anatomy.weight); nn.init.zeros_(self.prior_anatomy.bias)
+        # log_sigma 범위 제한. 0 은 안쪽이라 0-init 동작에는 영향이 없다.
+        # 하한 -6 (sigma 2.5e-3) 은 실측 GT sd 0.18(log -1.7) 보다 한참 아래라 여유가 있고,
+        # 상한 3 은 폭주를 막는다.
+        self.prior_log_sigma_range = (-6.0, 3.0)
+
+    def pair_vec(self, pairs: torch.Tensor) -> torch.Tensor:
+        """[N,2] -> [N, emb_dim].  Emb(a)+Emb(b): 순서 불변."""
+        assert int(pairs.min()) >= 0 and int(pairs.max()) < self.n_roi, (
+            f"ROI 인덱스 범위 밖: {int(pairs.min())}..{int(pairs.max())} (n_roi={self.n_roi})")
+        return self.emb(pairs[:, 0]) + self.emb(pairs[:, 1])
+
+    def _mode_idx(self, mode, n: int, device) -> torch.Tensor:
+        if torch.is_tensor(mode):
+            assert mode.shape == (n,), (mode.shape, n)
+            return mode.long().to(device)
+        return torch.full((n,), int(mode), dtype=torch.long, device=device)
+
+    def prior_params(self, pairs: torch.Tensor, mode=0, anatomy: torch.Tensor | None = None):
+        """[N,2] -> (mu [N,D], log_sigma [N,D]).  p(z | pair) = N(mu, diag(exp(2*log_sigma))).
+
+        log_sigma 는 전부 0-init 이므로 학습 전에는 sigma == 1.0 이고 `mu + sigma*eps` 가
+        기존 `mu + eps` 와 **bit-exact 동일**하다 (1.0 곱은 float 항등).
+        """
+        m = self._mode_idx(mode, pairs.shape[0], pairs.device)
+        v = self.pair_vec(pairs)
+        mu = self.prior_mu(v) + self.mode_prior(m)
+        ls = self.prior_log_sigma(v) + self.mode_log_sigma(m)
+        if anatomy is not None:
+            assert self.prior_use_anatomy, "anatomy prior 통로가 꺼져 있다 (prior_use_anatomy=False)"
+            if anatomy.shape[0] == 1:
+                anatomy = anatomy.expand(pairs.shape[0], -1)
+            assert anatomy.shape == (pairs.shape[0], self.cond_dim), anatomy.shape
+            d = self.prior_anatomy(self.anatomy_norm(anatomy))
+            mu = mu + d[:, :self.latent_dim]
+            ls = ls + d[:, self.latent_dim:]
+        else:
+            assert not self.prior_use_anatomy, "prior_use_anatomy=True 인데 anatomy 가 없다"
+        lo, hi = self.prior_log_sigma_range
+        return mu, ls.clamp(lo, hi)
+
+    def prior_mean(self, pairs: torch.Tensor, mode=0) -> torch.Tensor:
+        """[N,2] -> mu_pair [N, latent_dim]. mode 는 int 또는 [N] tensor."""
+        m = self._mode_idx(mode, pairs.shape[0], pairs.device)
+        return self.prior_mu(self.pair_vec(pairs)) + self.mode_prior(m)
+
+    def prior_log_std(self, pairs: torch.Tensor, mode=0, anatomy=None) -> torch.Tensor:
+        """[N,2] -> log_sigma [N, latent_dim]. 0-init 상태에서는 전부 0 (sigma=1)."""
+        return self.prior_params(pairs, mode, anatomy)[1]
+
+    def sample_prior(self, pairs: torch.Tensor, mode=0, anatomy=None,
+                     generator: torch.Generator | None = None,
+                     eps: torch.Tensor | None = None) -> torch.Tensor:
+        """z ~ N(mu_pair, diag(sigma^2)).  eps 를 주면 재사용(재현/비교용).
+
+        0-init 에서 `mu + exp(0)*eps == mu + eps` 라 기존 `roi_atm.sample_z` 와 bit-exact 같다.
+        """
+        mu, ls = self.prior_params(pairs, mode, anatomy)
+        if eps is None:
+            eps = torch.randn(mu.shape, device=mu.device, dtype=mu.dtype, generator=generator)
+        assert eps.shape == mu.shape, (eps.shape, mu.shape)
+        return mu + torch.exp(ls) * eps
+
+    def anatomy_term(self, anatomy: torch.Tensor) -> torch.Tensor:
+        """cond 에 들어가는 anatomy 항. LayerNorm 으로 pair 항과 크기를 대등하게 맞춘다."""
+        return self.anatomy_gain * self.anatomy_norm(anatomy)
+
+    def forward(self, anatomy: torch.Tensor, pairs: torch.Tensor, mode=0) -> torch.Tensor:
+        """anatomy [1,C] 또는 [N,C], pairs [N,2] -> cond [N,C]. mode: 0 full / 1 segment."""
+        n = pairs.shape[0]
+        if anatomy.shape[0] == 1:
+            anatomy = anatomy.expand(n, -1)
+        assert anatomy.shape == (n, self.cond_dim), (anatomy.shape, n, self.cond_dim)
+        m = self._mode_idx(mode, n, pairs.device)
+        return self.anatomy_term(anatomy) + self.proj(self.pair_vec(pairs)) + self.mode_emb(m)

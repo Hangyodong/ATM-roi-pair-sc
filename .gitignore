@@ -1,0 +1,42 @@
+# ── 데이터 (전부 로컬. 합계 100 GB 이상이라 git 에 절대 넣지 않는다) ──
+PPMI_QC263_tracto/
+DBS_ONOFF_tracto/
+ppmi_probe/
+stable/
+templates/
+external/
+*.zip
+*.mat
+*.nii
+*.nii.gz
+*.tt.gz
+*.trk
+*.tck
+*.fib*
+
+# ── 산출물 ──
+outputs/
+!outputs/splits/
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.joblib
+*.log
+*.jsonl
+
+# ── 파이썬 ──
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+
+# ── 기타 ──
+.DS_Store
+gpu.lock

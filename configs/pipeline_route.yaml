@@ -1,0 +1,22 @@
+# ROUTE + GESTA 균형 파이프라인 (docs/ATM_ROUTE_LOSS_PASS_SC_GESTA_DETAILED_STRATEGY.md §25).
+# baseline 의 phase 6(sc_corr) checkpoint 에서 이어받는다: 이미 학습된 geometry/T1/endpoint/edge/corr 위에
+# route + ROI-pair 균형 노출 + GESTA synthetic + presence + magnitude + length 를 순서대로 켠다.
+# 사전 조건: outputs/roi_pairs/*/visit.npz (scripts/24), outputs/synthetic/ (scripts/22).
+phases:
+  - configs/route/s1_route.yaml
+  - configs/route/s2_presence.yaml
+  - configs/route/s3_mag.yaml
+  - configs/route/s4_length.yaml
+  - configs/route/s5_joint.yaml
+state_file: outputs/checkpoints/route2/pipeline_state.json
+lock_file: outputs/checkpoints/route2/pipeline.lock
+preempt_file: outputs/checkpoints/route2/preempt   # 이 파일이 있으면 학습을 양보하고 대기 (A10 -> H100 인계)
+val_subjects: outputs/splits/val.txt
+val_max_subjects: 3
+val_pairs_per_cell: 8
+val_n_per_pair: 16
+val_indiv_subjects: 8      # 개인차 지표(잔차 r 등)용 val subject 수 — 여러 명이어야 LOO 중심화가 된다
+val_pair_dice: false       # pair 별 복셀 dice (실제 생성이 필요해 비쌈)
+val_dice_pairs: 30
+test_subjects: outputs/splits/test.txt
+final_eval: true      # 마지막 phase 종료 후 test 31명 T1-only 평가 1회

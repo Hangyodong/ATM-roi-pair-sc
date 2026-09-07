@@ -1,0 +1,19 @@
+# 9-phase 전체 학습 (최종 전략 §7). 로컬 A10 과 PBS job 이 같은 드라이버로 pipeline_state.json 에서 이어받는다.
+phases:
+  - configs/phase2_geometry.yaml
+  - configs/phase3_t1_encoder.yaml
+  - configs/phase4_endpoint.yaml
+  - configs/phase5_edge.yaml
+  - configs/phase6_sc_corr.yaml
+  - configs/phase7_sc_mag.yaml
+  - configs/phase8_length.yaml
+  - configs/phase9_joint.yaml
+state_file: outputs/checkpoints/pipeline_state.json
+lock_file: outputs/checkpoints/pipeline.lock
+val_subjects: outputs/splits/val.txt
+val_max_subjects: 3
+val_pairs_per_cell: 8      # block(ctx-ctx/ctx-sub/sub-sub) × tier(소/중/대) cell 마다 pair 수
+val_n_per_pair: 16
+val_indiv_subjects: 8      # 개인차 지표(잔차 r 등)용 val subject 수 — 여러 명이어야 LOO 중심화가 된다
+val_pair_dice: false       # pair 별 복셀 dice (실제 생성이 필요해 비쌈)
+val_dice_pairs: 30
