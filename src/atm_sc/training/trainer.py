@@ -180,6 +180,11 @@ class Trainer:
         # 전략 문서 §1.2-1.4. template/std/mask 는 train split 에서만 온다 (누수 방지).
         # ROI 국소 anatomy (전략 문서 §3.2). global avg pool 이 지운 개인차를 head 에 되돌린다.
         self._local = {}                     # subject -> [R, D] (subject 당 1회 로드)
+        self._roi_labels = None              # stage3 격자의 아틀라스 (살아있는 풀링용)
+        self._o3_leaf = self._roi_cache = None
+        # 실측(A10, stage3): checkpoint 를 끄면 0.97 -> 0.55 s/step 이고 VRAM 은 9.3GB 로 같다.
+        # 원래 메모리를 아끼는 기법인데 여기선 안 아껴서 순수 낭비다.
+        model.atm.use_checkpoint = bool(cfg.use_checkpoint)
         if cfg.cond_local_dim:
             assert model.pair_emb.local_dim == cfg.cond_local_dim, (
                 'pair_emb 의 local_dim 이 config 와 다르다', model.pair_emb.local_dim, cfg.cond_local_dim)
@@ -236,16 +241,37 @@ class Trainer:
         """디코더 조건용 [K, cond_local_dim]. cond_local_dim = 0 이면 None."""
         if not self.cfg.cond_local_dim:
             return None
+        live = self._roi_from_live()
+        if live is not None:
+            return L_local.pair_local(live, pairs)
         from ..data.local_feats import load_roi_feats
         if sub not in self._local:
             self._local[sub] = load_roi_feats(sub, self.cfg.local_source, self.device,
                                               n_roi=self.model.n_roi)
         return L_local.pair_local(self._local[sub], pairs)
 
+    def _roi_from_live(self) -> torch.Tensor | None:
+        """UNet 을 학습 중이면 **이번 step 의** stage3 에서 ROI 풀링한다 (gradient 포함).
+        디스크 캐시는 동결 인코더 전용이다 -- 학습 중에 쓰면 낡은 값으로 조용히 틀린다."""
+        o3 = getattr(self, "_o3_leaf", None)
+        if o3 is None:
+            return None
+        if self._roi_cache is not None:
+            return self._roi_cache
+        if self._roi_labels is None:
+            from ..models.roi_pool import atlas_on_feature_grid
+            self._roi_labels = atlas_on_feature_grid(feat_shape=tuple(o3.shape[2:]))
+        from ..models.roi_pool import roi_pool
+        self._roi_cache = roi_pool(o3, self._roi_labels, self.model.n_roi)
+        return self._roi_cache
+
     def local_feat(self, sub: str) -> torch.Tensor | None:
         """subject 의 ROI 국소 anatomy [R, D]. count_local_dim = 0 이면 None."""
         if not self.cfg.count_local_dim:
             return None
+        live = self._roi_from_live()
+        if live is not None:
+            return live
         if sub not in self._local:
             from ..data.local_feats import load_roi_feats
             self._local[sub] = load_roi_feats(sub, self.cfg.local_source, self.device,
@@ -285,12 +311,21 @@ class Trainer:
         a_leaf = a_full.detach().requires_grad_(t1_trainable)
         assert torch.isfinite(a_leaf).all(), "anatomy feature NaN"
         out["anat_norm"] = float(a_leaf.norm())
+        # 살아있는 stage3 도 leaf 로 분리한다. 안 하면 count 블록의 backward 가 UNet 그래프를
+        # 직접 타고, 마지막 a_full.backward 에서 "backward a second time" 으로 죽는다.
+        o3_full = getattr(m, "_live_stage3", None)
+        self._o3_leaf = None if o3_full is None else o3_full.detach().requires_grad_(t1_trainable)
+        self._roi_cache = None                       # step 안에서 ROI 풀링 1회만
+        dLdo3 = None if self._o3_leaf is None else torch.zeros_like(self._o3_leaf)
         dLda = torch.zeros_like(a_leaf)
 
         def take_dLda(tag):
             if a_leaf.grad is not None:
                 out[f"dLda_{tag}"] = float(a_leaf.grad.norm())
                 dLda.add_(a_leaf.grad); a_leaf.grad = None
+            if self._o3_leaf is not None and self._o3_leaf.grad is not None:
+                out[f"dLdo3_{tag}"] = float(self._o3_leaf.grad.norm())
+                dLdo3.add_(self._o3_leaf.grad); self._o3_leaf.grad = None
 
         # [G] ------------------------------------------------------------------------
         gen_needed = bool(active & {"endpoint", "corr", "mag", "length", "presence"}) or \
@@ -612,8 +647,17 @@ class Trainer:
 
         # [A'] UNet backward 1회 ---------------------------------------------------------
         out["dLda_total"] = float(dLda.norm())
-        if t1_trainable and float(dLda.abs().max()) > 0:
-            a_full.backward(dLda)
+        if t1_trainable:
+            # a512 경로와 stage3 국소 경로의 gradient 를 **한 번에** UNet 으로 흘린다.
+            ts, gs = [], []
+            if float(dLda.abs().max()) > 0:
+                ts.append(a_full); gs.append(dLda)
+            if dLdo3 is not None and float(dLdo3.abs().max()) > 0:
+                out["dLdo3_total"] = float(dLdo3.norm())
+                ts.append(o3_full); gs.append(dLdo3)
+            if ts:
+                torch.autograd.backward(ts, gs)
+        self._o3_leaf = self._roi_cache = None
         out.update({f"gnorm_{g['name']}": self._group_norm(g["params"]) for g in self.groups})
 
         gn = torch.nn.utils.clip_grad_norm_(m.trainable_parameters(), cfg.grad_clip)

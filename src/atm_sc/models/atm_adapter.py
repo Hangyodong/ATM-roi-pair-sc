@@ -262,7 +262,7 @@ class ATMBundle(torch.nn.Module):
                 for p in self.unet_stage_parameters(st)]
 
     def encode_anatomy_grad(self, t1_w: torch.Tensor, level: str | None = None,
-                            use_checkpoint: bool = True) -> torch.Tensor:
+                            use_checkpoint: bool = True, return_stage3: bool = False):
         """T1 -> anatomy feature, level 이상의 stage 에 gradient 가 흐르는 경로.
 
         동결된 앞부분은 no_grad 로 돌리고, 학습하는 stage 는 torch.utils.checkpoint 로 감싸
@@ -279,6 +279,7 @@ class ATMBundle(torch.nn.Module):
                   ("stage3", lambda a: self._stage3(u, a)), ("stage4", lambda a: self._unet_stage4_fc(u, a))]
         train = set(self.trainable_unet_stages(level))
         h = t1_w.to(self.device)
+        o3 = None
         for name, fn in stages:
             if name not in train:
                 with torch.no_grad():
@@ -287,8 +288,13 @@ class ATMBundle(torch.nn.Module):
                 h = checkpoint(fn, h, use_reentrant=False)
             else:
                 h = fn(h)
+            if name == "stage3":
+                # 인코더를 학습하면 디스크 캐시된 ROI 국소 feature 는 **낡은 값**이 된다.
+                # 조용히 틀리는 종류라 살아있는 stage3 를 내보내 호출부에서 풀링하게 한다.
+                o3 = h
         assert h.shape == (1, ANATOMICAL_DIM), h.shape
-        return h
+        assert o3 is not None and o3.ndim == 5, 'stage3 출력을 못 잡았다'
+        return (h, o3) if return_stage3 else h
 
     @classmethod
     def _unet_stage3(cls, u, x):                       # 이전 이름 호환 (stage1~3)

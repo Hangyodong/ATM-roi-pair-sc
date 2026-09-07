@@ -66,8 +66,14 @@ def stage_extract(a):
     return done
 
 
-def _ridge_cv(X, Y, subs_idx, lams=(1e-1, 1, 10, 100, 1e3, 1e4), k=5, seed=0):
-    """subject 단위 k-fold. pair 평균은 **훈련 fold 로만** 계산한다 (누수 방지). -> 잔차 상관."""
+def _ridge_cv(X, Y, subs_idx=None, lams=(1e-1, 1, 10, 100, 1e3, 1e4), k=5, seed=0):
+    """subject 단위 k-fold. pair 평균은 **훈련 fold 로만** 계산한다 (누수 방지). -> 잔차 상관.
+
+    **쌍대(dual) 형태로 푼다.** 표본 206명 << 특징 29,889 이라 X^T X (29889^2) 를 만들면
+    7GB 에 O(p^3) 이라 사실상 끝나지 않는다. n < p 일 때는
+        W = X^T (X X^T + lam I)^-1 Y   -> 206x206 역행렬
+    이 수학적으로 동일하고 비교가 안 되게 싸다.
+    """
     n = X.shape[0]
     rng = np.random.default_rng(seed)
     fold = rng.permutation(n) % k
@@ -78,10 +84,9 @@ def _ridge_cv(X, Y, subs_idx, lams=(1e-1, 1, 10, 100, 1e3, 1e4), k=5, seed=0):
             tr, te = fold != f, fold == f
             mx, my = X[tr].mean(0), Y[tr].mean(0)            # pair 평균 = 훈련 fold 평균
             Xt, Yt = X[tr] - mx, Y[tr] - my
-            A = Xt.T @ Xt + lam * np.eye(X.shape[1])
-            W = np.linalg.solve(A, Xt.T @ Yt)
-            preds[te] = (X[te] - mx) @ W
-            Y_c = Y.copy()
+            K = Xt @ Xt.T + lam * np.eye(Xt.shape[0])        # [n_tr, n_tr] -- 쌍대
+            A = np.linalg.solve(K, Yt)
+            preds[te] = ((X[te] - mx) @ Xt.T) @ A
         # 채점: 훈련 fold 평균을 뺀 GT 잔차와의 상관
         gt = np.zeros_like(Y)
         for f in range(k):

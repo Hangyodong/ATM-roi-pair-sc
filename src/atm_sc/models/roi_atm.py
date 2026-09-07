@@ -278,8 +278,15 @@ class ROIPairATM(nn.Module):
         assert anat_input.ndim == 5 and anat_input.shape[1] == self.in_channels, (
             anat_input.shape, self.in_channels)
         if self.unet_level == "none":
+            self._live_stage3 = None
             return self.encode_anatomy(anat_input)
-        return self.atm.encode_anatomy_grad(anat_input, self.unet_level)
+        # 인코더를 학습하면 디스크 캐시 국소 feature 가 낡는다 -> 살아있는 stage3 를 보관해
+        # trainer 가 여기서 ROI 풀링하게 한다 (data/local_feats.py 캐시는 동결일 때만 유효).
+        a, o3 = self.atm.encode_anatomy_grad(anat_input, self.unet_level,
+                                             use_checkpoint=getattr(self.atm, "use_checkpoint", True),
+                                             return_stage3=True)
+        self._live_stage3 = o3
+        return a
 
     def train(self, mode: bool = True):
         """UNet 은 항상 eval (Dropout3d 비활성 -- batch 1 에서 p=0.2 dropout 은 feature 를 실행마다

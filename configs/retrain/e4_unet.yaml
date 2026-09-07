@@ -1,0 +1,71 @@
+# E4 인코더 해동 — UNet stage3 를 우리 목적으로 미세조정한다
+#
+# 왜: 동결 feature 의 천장이 게이트 아래다. 선형 ridge 로 끝점 ROI 국소 -> GT SC 잔차가 0.053,
+# 학습된 비선형 head 로 0.034 인데 필요한 값은 0.3 이상이다 (inter_subj 0.97 을 정직하게 얻으려면).
+# 이 UNet 은 "AF_L 이 어디 있나"로 학습됐고 우리 목적을 향해 학습된 적이 없다.
+#
+# 위험: subject 144명으로 22.4M 파라미터. 과적합이 매우 쉽다. 그래서
+#   - lr_t1 을 head 의 1/30 로 둔다
+#   - val resid_r 을 250 step 마다 보고 best 에서 판단한다
+#   - shuffled T1 이 같이 오르면 잡음을 외운 것이다 (드라이버가 매 평가마다 잰다)
+#
+# 캐시 주의: 인코더가 학습되면 s1b_feats 디스크 캐시는 낡은 값이 된다. trainer 가
+# **살아있는 stage3** 에서 ROI 풀링하도록 배선했다 (_roi_from_live).
+#
+# A2 template + residual — 전략 문서 §1·§4·§5
+#
+# 질문 (문서 §2.2):
+#   T1 에 GT SC residual 을 설명할 재현 가능한 신호가 있으며, end-to-end residual supervision
+#   으로 그 신호를 읽을 수 있는가?
+#
+# A1(53번) 과의 차이: A1 은 절대 count 손실을 켠 채 EMA 잔차 상관만 얹었다. 문서는 그 구성을
+# 경계한다 -- SC 분산의 89.3% 가 그룹 상수라 절대 손실의 기울기가 거의 전부 "템플릿을 더 잘
+# 맞춰라" 로 간다 (실측: P2 의 resid_r 0.124 가 P3 에서 corr/mag/scale 을 켜자 0.009 로 붕괴).
+# 여기서는 **절대 손실을 끄고** (드라이버가 count weight 를 0 으로 덮어쓴다) 정규화 잔차만 맞춘다.
+#
+# 타깃 (문서 §1.2-1.4, train split 전용 -- outputs/cache/sc_template_stats.npz):
+#   y = log1p(SC),  mu = mean_train(y),  sigma = std_train(y) (floor 0.1)
+#   delta = (y - mu) / sigma          <- 이걸 예측한다
+#   복원: SC_hat = expm1(mu + delta_hat * sigma)
+# 실측: train 144명에서 잔차가 log1p SC 분산의 **25.7%**, 유효 edge 3,321/3,321.
+#
+# arm 은 드라이버 --arm 이 정한다 (문서 §4.5 의 ablation A~D). 아래 loss 블록의 res/res_corr/diff
+# 는 그 기본값이고 드라이버가 덮어쓴다.
+#
+# 고정: decoder, prior, 생성 경로 (문서 §2.2). 학습되는 것은 count head 뿐이다.
+phase: a1_resid           # active = {"count"}
+subjects: outputs/splits/train.txt
+max_steps: 3000
+out_dir: outputs/checkpoints/retrain/e4_unet
+trainable: vae
+unet_level: stage3        # ★ E4: stage3+4 해동 (22.4M). 국소 feature 를 만드는 층이 여기다
+t1_source: rigid
+in_channels: 2
+template: true
+resume: outputs/checkpoints/retrain/d3_joint/d3_joint_step3000.pt
+log_every: 50
+save_every: 500
+
+train:
+  bn_mode: eval
+  sc_mode: pass
+  max_pairs_per_step: null
+  chunk: 2048
+  lr_t1: 1.0e-05          # head 보다 한 자릿수 낮게 -- 144명으로 22.4M 을 학습한다
+  lr_vae_enc: 0.0
+  lr_dec: 0.0
+  lr_heads: 3.0e-04
+  use_checkpoint: false   # 실측: stage3 에서 0.97 -> 0.55 s/step, VRAM 은 9.3GB 로 동일
+  grad_clip: 50.0
+  seed: 0
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  sc_groups: block
+  resid_beta: 1.0         # SmoothL1 beta (정규화 잔차 단위이므로 1.0 = 1 sigma)
+
+loss:
+  count: 0.0              # 드라이버가 항상 0 으로 덮어쓴다 (문서 §4.5)
+  res: 1.0
+  res_corr: 0.2
+  diff: 0.2
