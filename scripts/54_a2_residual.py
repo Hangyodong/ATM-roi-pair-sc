@@ -88,7 +88,7 @@ def release_lock(lock: Path) -> None:
 
 # ─────────────────────────────────────────────── 평가 (전략 문서 §8.1)
 def resid_eval(model, subs: list[str], stats: dict, t1_source: str, init_bundle: str = "AF_L",
-               n_perm: int = 200, seed: int = 0) -> dict:
+               n_perm: int = 200, seed: int = 0, tier1_stats: dict | None = None) -> dict:
     """val subject 의 count head 예측으로 개인차 지표 일습. 생성 경로는 안 쓴다 (싸다)."""
     R = int(model.n_roi)
     iu = np.triu_indices(R, 1)
@@ -113,19 +113,29 @@ def resid_eval(model, subs: list[str], stats: dict, t1_source: str, init_bundle:
     if ld:
         assert locs[0].shape == (Pt.shape[0], ld), (locs[0].shape, ld)
 
-    def pred_log1p(a, loc=None):
-        v = torch.nn.functional.softplus(model.edge_log_counts(a, Pt, loc)).double().cpu().numpy()
+    td = int(getattr(model.count_head, "tier1_dim", 0) or 0)
+    t1s = None
+    if td:
+        from atm_sc.data.anat_tier1 import pair_input
+        assert tier1_stats is not None, "tier1_dim > 0 인데 통계가 안 넘어왔다"
+        t1s = [torch.as_tensor(pair_input(s, tier1_stats, t1_source), device=model.device) for s in subs]
+
+    def pred_log1p(a, loc=None, t1=None):
+        v = torch.nn.functional.softplus(model.edge_log_counts(a, Pt, loc, t1)).double().cpu().numpy()
         assert np.isfinite(v).all(), "count head 예측에 NaN/Inf"
         return v
 
-    P = np.stack([pred_log1p(a, l) for a, l in zip(feats, locs)])
+    P = np.stack([pred_log1p(a, l, (t1s[i] if td else None))
+                  for i, (a, l) in enumerate(zip(feats, locs))])
     # shuffled: 전역과 국소를 **같은** 이웃 subject 것으로 바꾼다 (한쪽만 바꾸면 대조가 성립 안 함)
-    P_shuf = np.stack([pred_log1p(feats[(i + 1) % len(subs)], locs[(i + 1) % len(subs)])
+    P_shuf = np.stack([pred_log1p(feats[(i + 1) % len(subs)], locs[(i + 1) % len(subs)],
+                                  (t1s[(i + 1) % len(subs)] if td else None))
                        for i in range(len(subs))])
     # zero T1 은 캐시가 없으므로 UNet 을 한 번만 돈다 (subject 무관이라 1회면 충분).
     a_zero = model.atm.encode_anatomy(torch.zeros_like(t1_input(model, subs[0], t1_source)))
     l_zero = torch.zeros_like(locs[0]) if ld else None
-    P_zero = np.broadcast_to(pred_log1p(a_zero, l_zero), P.shape)
+    P_zero = np.broadcast_to(pred_log1p(a_zero, l_zero,
+                                        (torch.zeros_like(t1s[0]) if td else None)), P.shape)
     del a_zero
     torch.cuda.empty_cache()
 
@@ -175,6 +185,7 @@ def resid_eval(model, subs: list[str], stats: dict, t1_source: str, init_bundle:
 # ─────────────────────────────────────────────── 자기검증
 def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> dict:
     ld = int(getattr(built["cfg"], "count_local_dim", 0) or 0)
+    td = int(getattr(built["cfg"], "count_tier1_dim", 0) or 0)
     out = {}
     # (1) 누수: 템플릿은 train 만으로 만들어졌는가
     used = set(stats["subjects"].tolist())
@@ -190,7 +201,7 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     ea = EndpointAssigner(np.load(CACHE / "dist_maps.npy"), nib.load(ATLAS).affine, tau=0.5,
                           device=device, d_bg=None if cfg.sc_mode == "endpoint" else 2.0)
     s0, s1 = ROIPairSubject(built["subjects"][0]), ROIPairSubject(built["subjects"][1])
-    m0, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)
+    m0, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td)
     ib = built["init_bundle"]
     a0 = anatomy_feature(m0, s0.sub, ib, source=built["t1_source"])
     a1 = anatomy_feature(m0, s1.sub, ib, source=built["t1_source"])
@@ -198,7 +209,7 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     torch.cuda.empty_cache()
 
     def one(weights):
-        mm, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)
+        mm, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td)
         cc = copy.deepcopy(cfg); cc.active = {"count"}
         tr = Trainer(mm, ea, cc, weights)
         o = tr.step(s0, a0, partner=(s1, a1) if (weights.diff > 0 or weights.var > 0) else None)
@@ -239,7 +250,7 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     if ld:
         R = int(stats["n_roi"])
         mg, _ = from_checkpoint(built["resume"], device=device)                    # 전역 전용
-        ml, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)  # 국소 가지 추가
+        ml, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td)  # 국소 가지 추가
         iu = np.triu_indices(R, 1)
         Pt = torch.as_tensor(np.stack(iu, 1).astype(np.int64), device=device)
         fr = load_roi_feats(s0.sub, built["t1_source"], device, n_roi=R)
@@ -270,6 +281,9 @@ def main():
     ap.add_argument("--selfcheck-only", action="store_true")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--tier1", action="store_true",
+                    help="티어 1 해부량(자로 잰 값)을 count head 에 넣는다. "
+                         "프로브 실측 r=0.1305 로 학습된 feature 를 전부 이긴다")
     ap.add_argument("--local", action="store_true",
                     help="count head 에 ROI 국소 anatomy 를 넣는다 (전략 문서 §3.2). "
                          "실측: 전역 a512 는 subject 성분 2.1%%, ROI 국소는 13.4%%")
@@ -282,7 +296,13 @@ def main():
     for k, v in ARMS[a.arm].items():
         setattr(built["weights"], k, v)
     built["weights"].count = 0.0                    # 문서 §4.5: 절대 손실은 끈다
-    tag = a.arm + ("_local" if a.local else "")
+    tag = a.arm + ("_local" if a.local else "") + ("_t1f" if a.tier1 else "")
+    if a.tier1:
+        from atm_sc.data.anat_tier1 import PAIR_DIM, STATS_PATH, pair_stats
+        pair_stats(built["subjects"])                      # train 전용, 없으면 만든다
+        built["cfg"].count_tier1_dim = PAIR_DIM
+        built["cfg"].tier1_stats = str(STATS_PATH)
+        print(f"[a2] 티어 1 해부량 사용: tier1_dim={PAIR_DIM}", flush=True)
     if a.local:
         built["cfg"].count_local_dim = local_dim(built["t1_source"])
         print(f"[a2] ROI 국소 anatomy 사용: local_dim={built['cfg'].count_local_dim}", flush=True)
@@ -297,6 +317,10 @@ def main():
     if a.selfcheck_only:
         return
 
+    t1stats = None
+    if a.tier1:
+        from atm_sc.data.anat_tier1 import pair_stats as _ps
+        t1stats = _ps(built["subjects"])
     val_subs = [l.strip() for l in (ROOT / "outputs/splits/val.txt").read_text().splitlines() if l.strip()]
     trace = EVAL / f"a2_residual_trace_{tag}.jsonl"
 
@@ -308,7 +332,7 @@ def main():
         try:
             with torch.no_grad():
                 m = resid_eval(model, val_subs, stats, built["t1_source"],
-                               init_bundle=built["init_bundle"])
+                               init_bundle=built["init_bundle"], tier1_stats=t1stats)
         finally:
             torch.set_rng_state(rng_cpu)
             if rng_cuda is not None:

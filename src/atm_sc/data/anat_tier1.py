@@ -145,3 +145,41 @@ def assert_subject_varying(feats: list[dict], min_cv: float = 1e-3) -> dict:
             continue
         assert v > min_cv, f"{k} 가 사실상 상수다 (subject CV {v:.2e}) -- 개인 정보가 없다"
     return rep
+
+
+# ─────────────── 모델 입력으로 쓰기 위한 train 전용 표준화 ───────────────
+# 프로브 실측(206명, subject 5-fold, 순열 50회): pair 9차 -> GT SC 잔차 **r = 0.1305**
+# (p = 0.0, 귀무 mean 0.0002 sd 0.0132 -- 10 sd). 전역 크기 3개는 0.0403, 학습된 국소
+# feature 는 선형으로 0.053 이다. **자로 잰 값이 pretrained 인코더를 이긴다.**
+# 9차의 스케일이 제각각이라(거리 ~65mm, log 부피 ~10, 대비 ~0.1) 반드시 표준화해서 넣는다.
+
+STATS_PATH = CACHE / "anat_tier1_pair_stats.npz"
+
+
+def pair_stats(subjects: list[str], source: str = "rigid", path: Path | None = None) -> dict:
+    """train subject 로만 pair feature 평균/표준편차를 만든다 (누수 방지). 캐시한다."""
+    path = Path(path) if path is not None else STATS_PATH
+    if path.exists():
+        z = np.load(path, allow_pickle=False)
+        if list(z["subjects"]) == list(np.array(subjects, dtype="U16")):
+            return {k: z[k] for k in z.files}
+    pairs = np.stack(np.triu_indices(N_ROI, 1), 1)
+    acc = np.stack([pair_features(load(s, source), pairs) for s in subjects])   # [N,K,9]
+    mu, sd = acc.mean(0), acc.std(0)
+    assert np.isfinite(mu).all() and np.isfinite(sd).all()
+    # pair 마다 표준편차가 0 인 축이 있을 수 있다(예: 아틀라스 고정 성분) -> 하한
+    sd = np.maximum(sd, 1e-3)
+    out = {"mean": mu.astype(np.float32), "std": sd.astype(np.float32),
+           "subjects": np.array(subjects, dtype="U16")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **out)
+    print(f"[anat_tier1] pair 표준화 통계 저장: {path} (train {len(subjects)}명, {mu.shape})", flush=True)
+    return out
+
+
+def pair_input(sub: str, stats: dict, source: str = "rigid") -> np.ndarray:
+    """[K, 9] 표준화된 pair feature. K 는 upper-triangle 순서(np.triu_indices)."""
+    pairs = np.stack(np.triu_indices(N_ROI, 1), 1)
+    x = (pair_features(load(sub, source), pairs) - stats["mean"]) / stats["std"]
+    assert np.isfinite(x).all(), f"{sub}: 표준화 후 NaN/Inf"
+    return x.astype(np.float32)

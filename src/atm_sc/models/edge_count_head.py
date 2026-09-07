@@ -44,7 +44,7 @@ def as_template(t, name: str = "template") -> torch.Tensor:
 class EdgeCountHead(nn.Module):
     def __init__(self, anatomy_dim: int = 512, emb_dim: int = 64, hidden: int = 256,
                  init_log_count: float = 5.0, template=None, template_floor: float = 1e-2,
-                 local_dim: int = 0):
+                 local_dim: int = 0, tier1_dim: int = 0):
         """template: [R,R] train 평균 count. 주면 인수분해 모드 (없으면 기존 동작 그대로).
         template_floor: log(0) 을 피하는 바닥값. count < 1 은 "생성 0 개" 라 1e-2 는 0 과 같다.
 
@@ -72,6 +72,15 @@ class EdgeCountHead(nn.Module):
         if self.local_dim:
             self.local_proj = nn.Linear(self.local_dim, hidden)
             nn.init.zeros_(self.local_proj.weight); nn.init.zeros_(self.local_proj.bias)
+        # 티어 1: 자로 잰 해부량 (ROI 조직량·centroid 거리·경계 대비). 프로브 실측 r = 0.1305
+        # (p=0.0, 귀무 sd 0.0132) 로 학습된 인코더 feature 를 전부 이긴다. 9차라 작지만
+        # subject 간 코사인이 0.119 (a512 는 0.9994) 로 개인 정보 밀도가 압도적이다.
+        self.tier1_dim = int(tier1_dim)
+        self.tier1_proj = None
+        if self.tier1_dim:
+            self.tier1_proj = nn.Sequential(nn.Linear(self.tier1_dim, hidden), nn.GELU(),
+                                            nn.Linear(hidden, hidden))
+            nn.init.zeros_(self.tier1_proj[-1].weight); nn.init.zeros_(self.tier1_proj[-1].bias)
 
     def _template_term(self, pairs, k: int, device) -> torch.Tensor:
         assert pairs is not None, "템플릿 인수분해 head 는 pair 인덱스가 필요하다 (forward(..., pairs=...))"
@@ -84,7 +93,8 @@ class EdgeCountHead(nn.Module):
 
     def forward(self, anatomy: torch.Tensor, pair_vec: torch.Tensor,
                 pairs: torch.Tensor | None = None,
-                local: torch.Tensor | None = None) -> torch.Tensor:
+                local: torch.Tensor | None = None,
+                tier1: torch.Tensor | None = None) -> torch.Tensor:
         """anatomy [1,C] 또는 [K,C], pair_vec [K,E] -> log_count [K] (자연로그).
         pairs [K,2] 는 템플릿 인수분해 모드에서만 필요하다.
         local [K, local_dim] 은 local_dim > 0 일 때 pair 별 국소 anatomy."""
@@ -100,6 +110,12 @@ class EdgeCountHead(nn.Module):
             h = h + self.local_proj(local)
         else:
             assert local is None, "local_dim = 0 인데 local feature 가 넘어왔다"
+        if self.tier1_proj is not None:
+            assert tier1 is not None, "tier1_dim > 0 인데 tier1 feature 가 안 넘어왔다"
+            assert tier1.shape == (k, self.tier1_dim), (tier1.shape, k, self.tier1_dim)
+            h = h + self.tier1_proj(tier1)
+        else:
+            assert tier1 is None, "tier1_dim = 0 인데 tier1 feature 가 넘어왔다"
         out = self.net[1:](h).squeeze(-1)
         if self.template_log is not None:
             out = out + self._template_term(pairs, k, out.device)

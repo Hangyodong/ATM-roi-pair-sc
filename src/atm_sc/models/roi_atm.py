@@ -86,6 +86,7 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
     kw.setdefault("prior_use_anatomy", bool(sd.get("prior_use_anatomy", False)))
     kw.setdefault("count_local_dim", int(sd.get("count_local_dim", 0)))
     kw.setdefault("cond_local_dim", int(sd.get("cond_local_dim", 0)))
+    kw.setdefault("count_tier1_dim", int(sd.get("count_tier1_dim", 0)))
     if sd.get("pair_anchor"):
         kw.setdefault("pair_anchor", sd["pair_anchor"])
         kw.setdefault("anchor_alpha", float(sd.get("anchor_alpha", 0.0)))
@@ -107,7 +108,8 @@ class ROIPairATM(nn.Module):
                  in_channels: int = 2, template=None, use_refiner: bool = False,
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
                  count_local_dim: int = 0, cond_local_dim: int = 0,
-                 pair_anchor: str | bool | None = None, anchor_alpha: float = 0.0):
+                 pair_anchor: str | bool | None = None, anchor_alpha: float = 0.0,
+                 count_tier1_dim: int = 0):
         """trainable: 'decoder' | 'vae' | 'vae+unet4' | 'full'.
         unet_level: 'none' | 'stage4' | 'stage3' | 'stage2' | 'full'. 주면 trainable 의 UNet 부분을 덮어쓴다.
         'full' = VAE 인코더/디코더 + UNet 전체 + heads (최종 전략 §2).
@@ -159,7 +161,8 @@ class ROIPairATM(nn.Module):
         # count_head = pass 기준(SC 값) 이므로 sc_pass 템플릿을 쓴다.
         self.count_head = EdgeCountHead(ANATOMICAL_DIM, emb_dim,
                                         template=None if tpl is None else tpl["sc_pass"],
-                                        local_dim=int(count_local_dim)
+                                        local_dim=int(count_local_dim),
+                                        tier1_dim=int(count_tier1_dim)
                                         ).to(self.device) if use_edge_head else None
         # pass 기준(SC 값)과 별도로 **끝점 기준** 개수를 예측한다. 추론에서 pair 마다 몇 가닥을 만들지 정하는 값.
         # GT: 100만 가닥 중 49 %가 두 ROI 를 끝점으로 갖고, pair 당 1~10,150 개로 천차만별이다.
@@ -348,12 +351,13 @@ class ROIPairATM(nn.Module):
         return self.edge_head(anatomy, self.pair_emb.pair_vec(cp), cp)
 
     def edge_log_counts(self, anatomy: torch.Tensor, pairs: torch.Tensor,
-                        local: torch.Tensor | None = None) -> torch.Tensor:
+                        local: torch.Tensor | None = None,
+                        tier1: torch.Tensor | None = None) -> torch.Tensor:
         """[K,2] -> 예측 log count [K] (자연로그). exp 하면 그 edge 가 가져야 할 segment/streamline 수.
         local [K, D] 은 count head 가 local_dim > 0 으로 만들어졌을 때만 준다 (pair 별 국소 anatomy)."""
         assert self.count_head is not None, "count head 비활성"
         cp = canonical_pairs(pairs)
-        return self.count_head(anatomy, self.pair_emb.pair_vec(cp), cp, local)
+        return self.count_head(anatomy, self.pair_emb.pair_vec(cp), cp, local, tier1)
 
     def edge_log_counts_end(self, anatomy: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
         """[K,2] -> 끝점 기준 log count [K]. exp 하면 그 pair 를 끝점으로 갖는 가닥 수."""

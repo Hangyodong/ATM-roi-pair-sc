@@ -113,6 +113,8 @@ class TrainConfig:
     resid_stats: str | None = None        # train split 전용 SC 통계 npz (data/sc_template.py)
     count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
     cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
+    count_tier1_dim: int = 0              # >0 이면 count head 가 티어 1 해부량(자로 잰 값)을 받는다
+    tier1_stats: str | None = None        # train 전용 표준화 통계 npz (data/anat_tier1.pair_stats)
     pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
     anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
     anchor_alpha_steps: int = 0           # >0 이면 alpha 를 0 -> anchor_alpha_end 로 선형 램프업.
@@ -181,6 +183,16 @@ class Trainer:
         # ROI 국소 anatomy (전략 문서 §3.2). global avg pool 이 지운 개인차를 head 에 되돌린다.
         self._local = {}                     # subject -> [R, D] (subject 당 1회 로드)
         self._roi_labels = None              # stage3 격자의 아틀라스 (살아있는 풀링용)
+        self._tier1 = {}                     # subject -> [K, 9] (표준화된 티어 1 pair feature)
+        self._tier1_stats = None
+        if cfg.count_tier1_dim:
+            assert cfg.tier1_stats, 'count_tier1_dim > 0 이면 tier1_stats 경로가 필요하다'
+            import numpy as _np
+            z = _np.load(cfg.tier1_stats, allow_pickle=False)
+            self._tier1_stats = {k: z[k] for k in z.files}
+            assert model.count_head.tier1_dim == cfg.count_tier1_dim, (
+                'count head 의 tier1_dim 이 config 와 다르다',
+                model.count_head.tier1_dim, cfg.count_tier1_dim)
         self._o3_leaf = self._roi_cache = None
         # 실측(A10, stage3): checkpoint 를 끄면 0.97 -> 0.55 s/step 이고 VRAM 은 9.3GB 로 같다.
         # 원래 메모리를 아끼는 기법인데 여기선 안 아껴서 순수 낭비다.
@@ -264,6 +276,17 @@ class Trainer:
         from ..models.roi_pool import roi_pool
         self._roi_cache = roi_pool(o3, self._roi_labels, self.model.n_roi)
         return self._roi_cache
+
+    def tier1_feat(self, sub: str) -> torch.Tensor | None:
+        """[K, 9] 표준화된 티어 1 pair feature. 학습이 아니라 **계산된 값**이라 캐시해도 안전하다
+        (인코더가 학습돼도 안 변한다 -- 그게 국소 feature 와 다른 점이다)."""
+        if not self.cfg.count_tier1_dim:
+            return None
+        if sub not in self._tier1:
+            from ..data.anat_tier1 import pair_input
+            self._tier1[sub] = torch.as_tensor(
+                pair_input(sub, self._tier1_stats, self.cfg.local_source), device=self.device)
+        return self._tier1[sub]
 
     def local_feat(self, sub: str) -> torch.Tensor | None:
         """subject 의 ROI 국소 anatomy [R, D]. count_local_dim = 0 이면 None."""
@@ -578,7 +601,8 @@ class Trainer:
             P_all = torch.stack([iu[0], iu[1]], 1)
             fr = self.local_feat(subject.sub)
             loc = None if fr is None else L_local.pair_local(fr, P_all)
-            logc = m.edge_log_counts(a_leaf, P_all, loc)
+            t1f = self.tier1_feat(subject.sub)
+            logc = m.edge_log_counts(a_leaf, P_all, loc, t1f)
             gt_c = gt_w[iu[0], iu[1]]
             mk = ({b: v[iu[0], iu[1]] for b, v in self.masks.items()} if self.masks is not None else None)
             l_cnt = L.edge_count_loss(logc, gt_c, mk)
@@ -611,7 +635,7 @@ class Trainer:
                     a2 = m.anatomy_forward(pa).detach()      # UNet 은 이 경로로 학습하지 않는다
                     fr2 = self.local_feat(ps.sub)
                     loc2 = None if fr2 is None else L_local.pair_local(fr2, P_all)
-                    logc2 = m.edge_log_counts(a2, P_all, loc2)
+                    logc2 = m.edge_log_counts(a2, P_all, loc2, self.tier1_feat(ps.sub))
                     gt2 = torch.as_tensor(np.asarray(ps.sc_mat, np.float32),
                                           device=self.device)[iu[0], iu[1]]
                     d_pred2 = (torch.nn.functional.softplus(logc2) - tpl) / sd
