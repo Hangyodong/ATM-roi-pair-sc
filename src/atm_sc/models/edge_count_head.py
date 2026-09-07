@@ -43,9 +43,17 @@ def as_template(t, name: str = "template") -> torch.Tensor:
 
 class EdgeCountHead(nn.Module):
     def __init__(self, anatomy_dim: int = 512, emb_dim: int = 64, hidden: int = 256,
-                 init_log_count: float = 5.0, template=None, template_floor: float = 1e-2):
+                 init_log_count: float = 5.0, template=None, template_floor: float = 1e-2,
+                 local_dim: int = 0):
         """template: [R,R] train 평균 count. 주면 인수분해 모드 (없으면 기존 동작 그대로).
-        template_floor: log(0) 을 피하는 바닥값. count < 1 은 "생성 0 개" 라 1e-2 는 0 과 같다."""
+        template_floor: log(0) 을 피하는 바닥값. count < 1 은 "생성 0 개" 라 1e-2 는 0 과 같다.
+
+        local_dim > 0: pair 별 **국소** anatomy feature 를 받는 별도 가지 (전략 문서 §3.2).
+        왜 별도 가지인가 -- 실측(175명): 이 head 가 받는 전역 `a512` 는 subject 성분이 **2.1%**
+        뿐인데(subject 간 코사인 0.9994) ROI 국소 pooling 은 **13.4%** 다. global average pooling
+        이 개인차를 지운 뒤의 벡터만 들어오고 있었다. GT SC 카운트의 subject 성분은 18.5% 다.
+        0-init 이라 켜도 시작은 bit-exact 이고, 기존 checkpoint 를 그대로 싣는다.
+        """
         super().__init__()
         self.anatomy_dim, self.emb_dim = anatomy_dim, emb_dim
         self.init_log_count = float(init_log_count)
@@ -57,6 +65,13 @@ class EdgeCountHead(nn.Module):
         # 고정 buffer -- 학습하지 않는다 (train 144명 평균이고 개인차만 f 가 맞춘다).
         self.register_buffer("template_log", None if template is None else
                              as_template(template).clamp(min=template_floor).log())
+        self.local_dim = int(local_dim)
+        # 첫 층 출력에 더한다 (concat 이 아니라 가산). concat 이면 net[0] 의 shape 이 바뀌어
+        # 기존 checkpoint 를 못 싣는다.
+        self.local_proj = None
+        if self.local_dim:
+            self.local_proj = nn.Linear(self.local_dim, hidden)
+            nn.init.zeros_(self.local_proj.weight); nn.init.zeros_(self.local_proj.bias)
 
     def _template_term(self, pairs, k: int, device) -> torch.Tensor:
         assert pairs is not None, "템플릿 인수분해 head 는 pair 인덱스가 필요하다 (forward(..., pairs=...))"
@@ -68,23 +83,33 @@ class EdgeCountHead(nn.Module):
         return self.template_log.to(device)[i, j]
 
     def forward(self, anatomy: torch.Tensor, pair_vec: torch.Tensor,
-                pairs: torch.Tensor | None = None) -> torch.Tensor:
+                pairs: torch.Tensor | None = None,
+                local: torch.Tensor | None = None) -> torch.Tensor:
         """anatomy [1,C] 또는 [K,C], pair_vec [K,E] -> log_count [K] (자연로그).
-        pairs [K,2] 는 템플릿 인수분해 모드에서만 필요하다."""
+        pairs [K,2] 는 템플릿 인수분해 모드에서만 필요하다.
+        local [K, local_dim] 은 local_dim > 0 일 때 pair 별 국소 anatomy."""
         assert pair_vec.ndim == 2 and pair_vec.shape[1] == self.emb_dim, pair_vec.shape
         k = pair_vec.shape[0]
         if anatomy.shape[0] == 1:
             anatomy = anatomy.expand(k, -1)
         assert anatomy.shape == (k, self.anatomy_dim), (anatomy.shape, k, self.anatomy_dim)
-        out = self.net(torch.cat([anatomy, pair_vec], dim=-1)).squeeze(-1)
+        h = self.net[0](torch.cat([anatomy, pair_vec], dim=-1))
+        if self.local_proj is not None:
+            assert local is not None, "local_dim > 0 인데 local feature 가 안 넘어왔다"
+            assert local.shape == (k, self.local_dim), (local.shape, k, self.local_dim)
+            h = h + self.local_proj(local)
+        else:
+            assert local is None, "local_dim = 0 인데 local feature 가 넘어왔다"
+        out = self.net[1:](h).squeeze(-1)
         if self.template_log is not None:
             out = out + self._template_term(pairs, k, out.device)
         return out
 
     def count(self, anatomy: torch.Tensor, pair_vec: torch.Tensor,
-              pairs: torch.Tensor | None = None) -> torch.Tensor:
+              pairs: torch.Tensor | None = None,
+              local: torch.Tensor | None = None) -> torch.Tensor:
         """exp(log_count) [K]. 항상 >= 0."""
-        return torch.exp(self.forward(anatomy, pair_vec, pairs))
+        return torch.exp(self.forward(anatomy, pair_vec, pairs, local))
 
     def matrix(self, anatomy: torch.Tensor, pair_vec: torch.Tensor, pairs: torch.Tensor,
                n_roi: int) -> torch.Tensor:

@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from atm_sc.data.dataset import ROIPairSubject                          # noqa: E402
 from atm_sc.data.paths import ATLAS, CACHE                              # noqa: E402
+from atm_sc.data.local_feats import load_roi_feats, local_dim, pair_local  # noqa: E402
 from atm_sc.data.sc_template import load_or_build                       # noqa: E402
 from atm_sc.models.endpoint_assigner import EndpointAssigner            # noqa: E402
 from atm_sc.models.roi_atm import from_checkpoint                       # noqa: E402
@@ -101,16 +102,26 @@ def resid_eval(model, subs: list[str], stats: dict, t1_source: str, init_bundle:
     G = np.stack(G)
     assert np.isfinite(G).all(), "GT 에 NaN"
 
-    def pred_log1p(a):
-        v = torch.nn.functional.softplus(model.edge_log_counts(a, Pt)).double().cpu().numpy()
+    # count head 가 국소 feature 를 받도록 만들어졌으면 평가에서도 같은 입력을 준다.
+    ld = int(getattr(model.count_head, "local_dim", 0) or 0)
+    locs = [pair_local(load_roi_feats(s, t1_source, model.device, n_roi=R), Pt) if ld else None
+            for s in subs]
+    if ld:
+        assert locs[0].shape == (Pt.shape[0], ld), (locs[0].shape, ld)
+
+    def pred_log1p(a, loc=None):
+        v = torch.nn.functional.softplus(model.edge_log_counts(a, Pt, loc)).double().cpu().numpy()
         assert np.isfinite(v).all(), "count head 예측에 NaN/Inf"
         return v
 
-    P = np.stack([pred_log1p(a) for a in feats])
-    P_shuf = np.stack([pred_log1p(feats[(i + 1) % len(subs)]) for i in range(len(subs))])
+    P = np.stack([pred_log1p(a, l) for a, l in zip(feats, locs)])
+    # shuffled: 전역과 국소를 **같은** 이웃 subject 것으로 바꾼다 (한쪽만 바꾸면 대조가 성립 안 함)
+    P_shuf = np.stack([pred_log1p(feats[(i + 1) % len(subs)], locs[(i + 1) % len(subs)])
+                       for i in range(len(subs))])
     # zero T1 은 캐시가 없으므로 UNet 을 한 번만 돈다 (subject 무관이라 1회면 충분).
     a_zero = model.atm.encode_anatomy(torch.zeros_like(t1_input(model, subs[0], t1_source)))
-    P_zero = np.broadcast_to(pred_log1p(a_zero), P.shape)
+    l_zero = torch.zeros_like(locs[0]) if ld else None
+    P_zero = np.broadcast_to(pred_log1p(a_zero, l_zero), P.shape)
     del a_zero
     torch.cuda.empty_cache()
 
@@ -159,6 +170,7 @@ def resid_eval(model, subs: list[str], stats: dict, t1_source: str, init_bundle:
 
 # ─────────────────────────────────────────────── 자기검증
 def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> dict:
+    ld = int(getattr(built["cfg"], "count_local_dim", 0) or 0)
     out = {}
     # (1) 누수: 템플릿은 train 만으로 만들어졌는가
     used = set(stats["subjects"].tolist())
@@ -174,7 +186,7 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     ea = EndpointAssigner(np.load(CACHE / "dist_maps.npy"), nib.load(ATLAS).affine, tau=0.5,
                           device=device, d_bg=None if cfg.sc_mode == "endpoint" else 2.0)
     s0, s1 = ROIPairSubject(built["subjects"][0]), ROIPairSubject(built["subjects"][1])
-    m0, _ = from_checkpoint(built["resume"], device=device)
+    m0, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)
     ib = built["init_bundle"]
     a0 = anatomy_feature(m0, s0.sub, ib, source=built["t1_source"])
     a1 = anatomy_feature(m0, s1.sub, ib, source=built["t1_source"])
@@ -182,7 +194,7 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     torch.cuda.empty_cache()
 
     def one(weights):
-        mm, _ = from_checkpoint(built["resume"], device=device)
+        mm, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)
         cc = copy.deepcopy(cfg); cc.active = {"count"}
         tr = Trainer(mm, ea, cc, weights)
         o = tr.step(s0, a0, partner=(s1, a1) if weights.diff > 0 else None)
@@ -218,7 +230,28 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     out["L_diff_when_constant"] = l_const
     assert l_const > 0.5, f"상수 예측인데 L_diff 가 {l_const:.3f} 로 작다 -- shortcut 차단이 안 된다"
 
-    # (5) GT 잔차 신호
+    # (5) 국소 가지는 0-init -- 켜도 시작 예측이 전역 전용과 bit-exact 여야 한다
+    if ld:
+        R = int(stats["n_roi"])
+        mg, _ = from_checkpoint(built["resume"], device=device)                    # 전역 전용
+        ml, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)  # 국소 가지 추가
+        iu = np.triu_indices(R, 1)
+        Pt = torch.as_tensor(np.stack(iu, 1).astype(np.int64), device=device)
+        fr = load_roi_feats(s0.sub, built["t1_source"], device, n_roi=R)
+        with torch.no_grad():
+            v0 = mg.edge_log_counts(a0, Pt)
+            v1 = ml.edge_log_counts(a0, Pt, pair_local(fr, Pt))
+        d = float((v0 - v1).abs().max())
+        out["local_zero_init_max_abs_diff"] = d
+        assert d == 0.0, f"국소 가지 0-init 인데 예측이 바뀐다 (max|diff| = {d:.3e})"
+        # 국소 feature 가 실제로 subject 마다 다른가
+        fr2 = load_roi_feats(s1.sub, built["t1_source"], device, n_roi=R)
+        out["local_feat_cosine_two_subj"] = float(
+            torch.nn.functional.cosine_similarity(fr.flatten(), fr2.flatten(), dim=0))
+        del mg, ml
+        torch.cuda.empty_cache()
+
+    # (6) GT 잔차 신호
     out["resid_share"] = float(stats["resid_share"])
     out["n_edges_used"] = e
     print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
@@ -232,6 +265,9 @@ def main():
     ap.add_argument("--selfcheck-only", action="store_true")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--local", action="store_true",
+                    help="count head 에 ROI 국소 anatomy 를 넣는다 (전략 문서 §3.2). "
+                         "실측: 전역 a512 는 subject 성분 2.1%%, ROI 국소는 13.4%%")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
 
@@ -241,7 +277,11 @@ def main():
     for k, v in ARMS[a.arm].items():
         setattr(built["weights"], k, v)
     built["weights"].count = 0.0                    # 문서 §4.5: 절대 손실은 끈다
-    built["out_dir"] = Path(str(built["out_dir"]) + f"_{a.arm}")
+    tag = a.arm + ("_local" if a.local else "")
+    if a.local:
+        built["cfg"].count_local_dim = local_dim(built["t1_source"])
+        print(f"[a2] ROI 국소 anatomy 사용: local_dim={built['cfg'].count_local_dim}", flush=True)
+    built["out_dir"] = Path(str(built["out_dir"]) + f"_{tag}")
     stats = load_or_build(built["subjects"], STATS)
     built["cfg"].resid_stats = str(STATS)
     assert built["resume"] and built["resume"].exists(), built["resume"]
@@ -253,7 +293,7 @@ def main():
         return
 
     val_subs = [l.strip() for l in (ROOT / "outputs/splits/val.txt").read_text().splitlines() if l.strip()]
-    trace = EVAL / f"a2_residual_trace_{a.arm}.jsonl"
+    trace = EVAL / f"a2_residual_trace_{tag}.jsonl"
 
     def hook(step, model):
         rng_cpu = torch.get_rng_state()
@@ -269,10 +309,10 @@ def main():
             if rng_cuda is not None:
                 torch.cuda.set_rng_state_all(rng_cuda)
             model.train(was)
-        row = {"arm": a.arm, "step": int(step), "sec": time.time() - t0, **m}
+        row = {"arm": tag, "step": int(step), "sec": time.time() - t0, **m}
         with open(trace, "a") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"[eval/{a.arm}] step {step} resid_r={m['resid_r']:+.4f} "
+        print(f"[eval/{tag}] step {step} resid_r={m['resid_r']:+.4f} "
               f"(shuf {m['resid_r_shuffled']:+.4f} zero {m['resid_r_zero']:+.4f}) "
               f"ident={m['identification']:.3f}/{m['identification_chance']:.3f} "
               f"diff_r={m['diff_corr']:+.4f} var={m['variance_ratio']:.3f} "
@@ -293,10 +333,10 @@ def main():
 
     rows = [json.loads(l) for l in trace.read_text().splitlines() if l.strip()]
     best = max(rows, key=lambda r: r["resid_r"]) if rows else None
-    res = {"arm": a.arm, "weights": ARMS[a.arm], "config": a.config, "checkpoint": str(ck),
+    res = {"arm": tag, "weights": ARMS[a.arm], "local": bool(a.local), "config": a.config, "checkpoint": str(ck),
            "selfcheck": sc, "first": rows[0] if rows else None, "last": rows[-1] if rows else None,
            "best": best, "n_points": len(rows), "trace": str(trace)}
-    (EVAL / f"a2_residual_{a.arm}.json").write_text(json.dumps(res, ensure_ascii=False, indent=2))
+    (EVAL / f"a2_residual_{tag}.json").write_text(json.dumps(res, ensure_ascii=False, indent=2))
     print(json.dumps({k: res[k] for k in ("arm", "weights", "first", "last", "best")},
                      ensure_ascii=False, indent=2), flush=True)
 

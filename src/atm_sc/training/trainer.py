@@ -25,6 +25,7 @@ import torch
 from .. import losses as L
 from ..models.latent_prior import diag_log_prob as prior_log_prob
 from ..models.sc_builder import BundleAccumulator, SCBuilder, streamline_lengths
+from ..data import local_feats as L_local
 from ..data.roi_groups import BLOCKS, N_CTX, TIERS, block_masks
 from ..data.balanced_pair_sampler import BalanceConfig, BalancedPairSampler
 from ..data.segment_sampler import BalancedSegmentSampler, SegmentBalanceConfig
@@ -108,6 +109,8 @@ class TrainConfig:
     pair_sampling: str = "tier"          # recon/edge 양성 pair 샘플링: 'log' | 'uniform' | 'tier'(강도 구간별 같은 개수)
     sc_groups: str | None = "block"      # SC loss 를 ctx-ctx/ctx-sub/sub-sub 로 나눠 평균 (None = whole-brain 하나)
     resid_stats: str | None = None        # train split 전용 SC 통계 npz (data/sc_template.py)
+    count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
+    local_source: str = "rigid"           # 그 캐시의 프로토콜 (s1b_feats/{sub}_{source}.npz)
     resid_beta: float = 1.0               # SmoothL1 의 beta (정규화 잔차 단위)
     resid_momentum: float = 0.02          # ResidualCorr 의 subject 평균 EMA 계수
     resid_warmup: int = 200               # EMA 가 템플릿 초기값에서 벗어날 때까지 기울기 차단
@@ -166,6 +169,12 @@ class Trainer:
         # EMA 는 train 템플릿에서 출발한다: count head 가 템플릿 인수분해라 초기 예측이 정확히
         # log1p(template) 이고(softplus(log t) = log1p(t)) 시작 시점 잔차가 0 이라 편향이 없다.
         # 전략 문서 §1.2-1.4. template/std/mask 는 train split 에서만 온다 (누수 방지).
+        # ROI 국소 anatomy (전략 문서 §3.2). global avg pool 이 지운 개인차를 head 에 되돌린다.
+        self._local = {}                     # subject -> [R, D] (subject 당 1회 로드)
+        if cfg.count_local_dim:
+            assert model.count_head is not None and model.count_head.local_dim == cfg.count_local_dim, (
+                'count head 의 local_dim 이 config 와 다르다 -- 모델을 count_local_dim 으로 만들어야 한다',
+                getattr(model.count_head, 'local_dim', None), cfg.count_local_dim)
         self.rstats = None
         if self.w.res > 0 or self.w.res_corr > 0 or self.w.diff > 0:
             assert cfg.resid_stats, 'res/res_corr/diff 손실은 cfg.resid_stats 가 필요하다'
@@ -210,6 +219,16 @@ class Trainer:
         assert cfg.bn_mode in ("train", "eval", "recal_eval"), cfg.bn_mode
         self.ae_bns = [b for b in model.atm.net.ae.modules() if isinstance(b, torch.nn.BatchNorm1d)]
         assert self.ae_bns, "ConvVAE 에서 BatchNorm1d 를 하나도 못 찾았다 (구조가 바뀌었나?)"
+
+    def local_feat(self, sub: str) -> torch.Tensor | None:
+        """subject 의 ROI 국소 anatomy [R, D]. count_local_dim = 0 이면 None."""
+        if not self.cfg.count_local_dim:
+            return None
+        if sub not in self._local:
+            from ..data.local_feats import load_roi_feats
+            self._local[sub] = load_roi_feats(sub, self.cfg.local_source, self.device,
+                                              n_roi=self.model.n_roi)
+        return self._local[sub]
 
     def _set_ae_bn_eval(self) -> None:
         """ConvVAE 의 BatchNorm 만 eval 로 (running 통계 사용 + 갱신 안 함)."""
@@ -490,7 +509,9 @@ class Trainer:
             R = m.n_roi
             iu = torch.triu_indices(R, R, 1, device=self.device)
             P_all = torch.stack([iu[0], iu[1]], 1)
-            logc = m.edge_log_counts(a_leaf, P_all)
+            fr = self.local_feat(subject.sub)
+            loc = None if fr is None else L_local.pair_local(fr, P_all)
+            logc = m.edge_log_counts(a_leaf, P_all, loc)
             gt_c = gt_w[iu[0], iu[1]]
             mk = ({b: v[iu[0], iu[1]] for b, v in self.masks.items()} if self.masks is not None else None)
             l_cnt = L.edge_count_loss(logc, gt_c, mk)
@@ -521,7 +542,9 @@ class Trainer:
                     ps, pa = partner
                     assert ps.sub != subject.sub, "partner 가 같은 subject 다"
                     a2 = m.anatomy_forward(pa).detach()      # UNet 은 이 경로로 학습하지 않는다
-                    logc2 = m.edge_log_counts(a2, P_all)
+                    fr2 = self.local_feat(ps.sub)
+                    loc2 = None if fr2 is None else L_local.pair_local(fr2, P_all)
+                    logc2 = m.edge_log_counts(a2, P_all, loc2)
                     gt2 = torch.as_tensor(np.asarray(ps.sc_mat, np.float32),
                                           device=self.device)[iu[0], iu[1]]
                     d_pred2 = (torch.nn.functional.softplus(logc2) - tpl) / sd

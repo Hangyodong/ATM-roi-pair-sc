@@ -398,7 +398,8 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
     subs = [ROIPairSubject(s) for s in subjects]
     n_roi = subs[0].n_roi
     model = ROIPairATM(n_roi=n_roi, init_bundle=init_bundle, device=device, trainable=trainable,
-                       unet_level=unet_level, in_channels=in_channels, template=template)
+                       unet_level=unet_level, in_channels=in_channels, template=template,
+                       count_local_dim=int(getattr(cfg, "count_local_dim", 0)))
     unet_level = model.unet_level
     start_step, opt_state, rng_state = 0, None, None
     if resume is not None:
@@ -462,6 +463,8 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                     "trainable": trainable, "unet_level": unet_level,
                     "in_channels": model.in_channels, "template": model.template is not None,
                     "prior_use_anatomy": model.pair_emb.prior_use_anatomy,
+                    "count_local_dim": (model.count_head.local_dim
+                                       if model.count_head is not None else 0),
                     "t1_source": t1_source},           # 평가/추론이 같은 입력 프로토콜을 쓰게 한다
                    out_dir / name)
 
