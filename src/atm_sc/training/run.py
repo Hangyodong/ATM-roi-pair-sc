@@ -480,7 +480,8 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
         s = subs[rng.integers(len(subs))]
         anat = lambda x: feats[x.sub] if feats[x.sub] is not None else t1_input(model, x.sub, t1_source)
         partner = None
-        if getattr(tr.w, "diff", 0.0) > 0:        # L_diff 는 한 step 에 서로 다른 subject 2명이 필요 (§5.1)
+        if getattr(tr.w, "diff", 0.0) > 0 or getattr(tr.w, "var", 0.0) > 0:
+            # L_diff / L_var 는 한 step 에 서로 다른 subject 2명이 필요 (전략 문서 §5.1)
             assert len(subs) > 1, "diff 손실에는 subject 2명 이상 필요"
             k = int(rng.integers(len(subs) - 1))
             s2 = subs[k] if subs[k].sub != s.sub else subs[-1]

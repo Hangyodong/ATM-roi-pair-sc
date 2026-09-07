@@ -65,6 +65,27 @@ class PairAnchor(nn.Module):
         assert 0.0 <= a <= 1.0, a
         self.alpha.fill_(float(a))
 
+    @torch.no_grad()
+    def orient(self, S: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+        """GT streamline [N,128,3] 을 그 쌍의 앵커 방향에 맞춰 뒤집는다.
+
+        **필수다.** streamline 은 방향이 없는데 앵커는 i->j 로 정규화돼 있다. 실측(val 4명,
+        3,600 가닥): 저장된 방향 그대로면 **56.8%가 앵커와 반대**이고 앵커까지 평균 거리가
+        29.35mm, 방향을 맞추면 17.04mm 다. 정규화 없이 앵커 재매개화를 켜면 디코더가 앵커를
+        그대로 뱉는 것(raw~0)이 최선이 되어 복원이 29mm 에 고착된다 (D4 1차 실측 29.009mm).
+
+        절대 좌표 경로에서는 이 문제가 없다 -- 인코더가 방향까지 z 에 실어 디코더가 그대로
+        재현하기 때문이다 (W1-a 가 flip 이 recon 에 무관하다고 결론낸 것과 모순되지 않는다).
+        앵커가 방향을 **고정**하는 순간 비로소 문제가 된다.
+        """
+        assert S.ndim == 3 and S.shape[1:] == (128, 3), S.shape
+        assert pairs.shape == (S.shape[0], 2), (pairs.shape, S.shape)
+        a = self.anchor[upper_index(pairs[:, 0], pairs[:, 1], self.n_roi)]
+        d_fwd = ((S - a) ** 2).sum((1, 2))
+        d_rev = ((S.flip(1) - a) ** 2).sum((1, 2))
+        flip = (d_rev < d_fwd).view(-1, 1, 1)
+        return torch.where(flip, S.flip(1), S)
+
     def forward(self, raw: torch.Tensor, pairs: torch.Tensor, mm_global: torch.Tensor) -> torch.Tensor:
         """raw [N,128,3] ([-1,1]), pairs [N,2] canonical, mm_global [N,128,3] = 전역 박스 결과.
         -> alpha 로 섞은 mm. alpha = 0 이면 mm_global 과 **bit-exact**."""

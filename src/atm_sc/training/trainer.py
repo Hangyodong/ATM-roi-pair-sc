@@ -25,6 +25,7 @@ import torch
 from .. import losses as L
 from ..models.latent_prior import diag_log_prob as prior_log_prob
 from ..models.sc_builder import BundleAccumulator, SCBuilder, streamline_lengths
+from ..models.roi_pair_embedding import canonical_pairs
 from ..data import local_feats as L_local
 from ..data.roi_groups import BLOCKS, N_CTX, TIERS, block_masks
 from ..data.balanced_pair_sampler import BalanceConfig, BalancedPairSampler
@@ -59,6 +60,7 @@ class LossWeights:
     res: float = 0.0          # L_res  SmoothL1(정규화 잔차)
     res_corr: float = 0.0     # L_corr 1 - corr(정규화 잔차). EMA 가 아니라 고정 템플릿 기준
     diff: float = 0.0         # L_diff |(pred_a-pred_b) - (gt_a-gt_b)|_1. 2명/step 필요
+    var: float = 0.0          # L_var  |log(예측 쌍차 노름 / GT 쌍차 노름)|. 2명/step 필요
     mag: float = 0.5
     length: float = 0.2
     # 조건부 prior p(z|pair) 적합항 (W3-a). **KL 로 prior 를 학습시키면 안 된다** (C11 실측:
@@ -186,7 +188,7 @@ class Trainer:
                 'count head 의 local_dim 이 config 와 다르다 -- 모델을 count_local_dim 으로 만들어야 한다',
                 getattr(model.count_head, 'local_dim', None), cfg.count_local_dim)
         self.rstats = None
-        if self.w.res > 0 or self.w.res_corr > 0 or self.w.diff > 0:
+        if self.w.res > 0 or self.w.res_corr > 0 or self.w.diff > 0 or self.w.var > 0:
             assert cfg.resid_stats, 'res/res_corr/diff 손실은 cfg.resid_stats 가 필요하다'
             z = np.load(cfg.resid_stats, allow_pickle=False)
             tt = lambda k, d=torch.float32: torch.as_tensor(z[k], dtype=d, device=self.device)
@@ -199,7 +201,7 @@ class Trainer:
             assert bool(self.rstats['mask'].any()), 'edge mask 가 비어 있다'
             print(f"[trainer] 잔차 통계 {cfg.resid_stats} "
                   f"(edge {int(self.rstats['mask'].sum())}/{e})", flush=True)
-        assert not (self.w.diff > 0 and self.rstats is None)
+        assert not ((self.w.diff > 0 or self.w.var > 0) and self.rstats is None)
         self.resid_corr = None
         if self.w.resid > 0:
             assert getattr(model, 'template', None) is not None, (
@@ -452,6 +454,9 @@ class Trainer:
                 S_gt = torch.cat(Ss).to(self.device).float(); P_gt = torch.cat(Ps).to(self.device)
                 V_gt = torch.cat(Vs).to(self.device) if Vs else None
                 rw = None
+            if m.anchor is not None and float(m.anchor.alpha) > 0:
+                # 앵커가 방향을 고정하므로 GT 도 같은 방향으로 맞춘다 (PairAnchor.orient 주석 참조)
+                S_gt = m.anchor.orient(S_gt, canonical_pairs(P_gt))
             c = m.condition(a_leaf, P_gt, local=self.cond_local(subject.sub, P_gt))
             mu, logvar = m.encode_streamlines(S_gt, c)
             rec = m.decode(m.reparameterize(mu, logvar), c, P_gt)
@@ -506,6 +511,8 @@ class Trainer:
             S_sg, P_sg, L_sg, sinfo = ss.sample_batch(self.rng, cfg.seg_edges_per_step, cfg.n_seg_per_edge)
             out.update(sinfo)
             S_sg, P_sg = S_sg.to(self.device), P_sg.to(self.device)
+            if m.anchor is not None and float(m.anchor.alpha) > 0:
+                S_sg = m.anchor.orient(S_sg, canonical_pairs(P_sg))
             c = m.condition(a_leaf, P_sg, mode=1,                     # mode 1 = segment
                             local=self.cond_local(subject.sub, P_sg))
             mu, logvar = m.encode_streamlines(S_sg, c)
@@ -561,7 +568,7 @@ class Trainer:
                     l_rc = L.residual_corr_loss(d_pred, d_gt, msk)
                     tot_c = tot_c + w.res_corr * l_rc
                     out["L_res_corr"] = float(l_rc)
-                if w.diff > 0:
+                if w.diff > 0 or w.var > 0:
                     # 같은 출력을 내면 예측 차이가 0 이라 손실을 피할 수 없다 (§4.3).
                     assert partner is not None, "diff 손실인데 partner subject 가 안 넘어왔다"
                     ps, pa = partner
@@ -574,9 +581,15 @@ class Trainer:
                                           device=self.device)[iu[0], iu[1]]
                     d_pred2 = (torch.nn.functional.softplus(logc2) - tpl) / sd
                     d_gt2 = (torch.log1p(gt2) - tpl) / sd
-                    l_df = L.subject_diff_loss(d_pred, d_pred2, d_gt, d_gt2, msk)
-                    tot_c = tot_c + w.diff * l_df
-                    out["L_diff"] = float(l_df)
+                    if w.diff > 0:
+                        l_df = L.subject_diff_loss(d_pred, d_pred2, d_gt, d_gt2, msk)
+                        tot_c = tot_c + w.diff * l_df
+                        out["L_diff"] = float(l_df)
+                    if w.var > 0:
+                        # 정보를 늘리는 항이 아니라 있는 정보를 **출력 진폭으로 내보내는** 항이다.
+                        l_vr = L.subject_var_loss(d_pred, d_pred2, d_gt, d_gt2, msk)
+                        tot_c = tot_c + w.var * l_vr
+                        out["L_var"] = float(l_vr)
                     out["diff_gt_norm"] = float((d_gt - d_gt2)[msk].norm())
                     out["diff_pred_norm"] = float((d_pred - d_pred2)[msk].detach().norm())
                     out["diff_ratio"] = out["diff_pred_norm"] / max(out["diff_gt_norm"], 1e-8)

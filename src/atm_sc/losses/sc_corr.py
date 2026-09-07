@@ -158,3 +158,31 @@ def subject_diff_loss(dp_a: torch.Tensor, dp_b: torch.Tensor,
         assert mask.any(), "잔차 edge mask 가 비어 있음"
         dp, dg = dp[mask], dg[mask]
     return (dp - dg).abs().mean()
+
+
+def subject_var_loss(dp_a: torch.Tensor, dp_b: torch.Tensor,
+                     dg_a: torch.Tensor, dg_b: torch.Tensor,
+                     mask: torch.Tensor | None = None, eps: float = 1e-6) -> torch.Tensor:
+    """L_var — 예측 잔차의 **진폭**을 GT 에 맞춘다 (전략 문서 §4.4).
+
+    왜 필요한가 (실측): SmoothL1 은 불확실할 때 평균으로 수축하는 게 최적이라(regression to
+    the mean) 예측 개인차가 눌린다. `a2_residual_D_local` 학습 로그에서 diff_ratio 가 0.055 --
+    예측한 두 subject 차이가 GT 의 5.5% 뿐이고, 그래서 inter_subj_r 이 0.9997 에서 안 내려간다.
+    정보(train resid_r 0.10)는 있는데 출력으로 안 나오는 상태다.
+
+    두 subject 로 분산을 재는 근거: 독립 표본이면 E‖Δa − Δb‖² = 2·Var(Δ) 이므로 쌍차 노름을
+    맞추는 것이 표준편차를 맞추는 것과 같다 (상수배). 한 step 에 2명뿐이라 std 를 직접 재는
+    것보다 안정적이다.
+
+    로그 비를 쓰는 이유: 과소·과대를 대칭으로 벌하고, 비가 0.05 처럼 작을 때도 기울기가 산다.
+
+    **주의**: 이 손실만 키우면 잡음을 개인차로 증폭한다. self vs shuffled 격차와 식별 정확도를
+    반드시 함께 감시해야 한다 (문서 §4.4 의 경고).
+    """
+    dp, dg = dp_a - dp_b, (dg_a - dg_b).detach()
+    if mask is not None:
+        assert mask.any(), "잔차 edge mask 가 비어 있음"
+        dp, dg = dp[mask], dg[mask]
+    np_, ng = dp.norm(), dg.norm()
+    assert float(ng) > 0, "GT 두 subject 의 잔차 차이가 0 -- 같은 subject 인가"
+    return torch.log((np_ + eps) / (ng + eps)).abs()

@@ -54,6 +54,10 @@ ARMS = {
     "B": {"res": 1.0, "res_corr": 0.2, "diff": 0.0},     # + edge 별 증감 패턴
     "C": {"res": 1.0, "res_corr": 0.0, "diff": 0.2},     # + 동일 출력 collapse 억제
     "D": {"res": 1.0, "res_corr": 0.2, "diff": 0.2},     # 권장 조합
+    # 문서 §4.4 의 E. diff_ratio 0.055 (예측 개인차가 GT 의 5.5%) 를 직격한다.
+    # 정보를 늘리는 항이 아니라 **있는 정보를 출력 진폭으로 내보내는** 항이다.
+    "V": {"res": 1.0, "res_corr": 0.2, "diff": 0.2, "var": 0.5},
+    "V2": {"res": 0.5, "res_corr": 0.3, "diff": 0.3, "var": 1.0},   # 진폭 우선
 }
 
 
@@ -197,24 +201,25 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
         mm, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld)
         cc = copy.deepcopy(cfg); cc.active = {"count"}
         tr = Trainer(mm, ea, cc, weights)
-        o = tr.step(s0, a0, partner=(s1, a1) if weights.diff > 0 else None)
+        o = tr.step(s0, a0, partner=(s1, a1) if (weights.diff > 0 or weights.var > 0) else None)
         has_stats = tr.rstats is not None
         del tr, mm
         torch.cuda.empty_cache()
         return has_stats, o
 
     # (2) 새 손실이 전부 0 이면 기존 경로와 같다
-    w0 = copy.deepcopy(w); w0.res = w0.res_corr = w0.diff = 0.0
+    w0 = copy.deepcopy(w); w0.res = w0.res_corr = w0.diff = w0.var = 0.0
     has0, o0 = one(w0)
     assert (not has0) and "L_res" not in o0, "가중치 0 인데 잔차 손실이 켜졌다"
 
     # (3) 세 손실이 각각 켜지고 기울기가 count head 에 닿는가
-    for name, kw in (("res", {"res": 1.0}), ("res_corr", {"res_corr": 1.0}), ("diff", {"diff": 1.0})):
-        ww = copy.deepcopy(w); ww.res = ww.res_corr = ww.diff = 0.0; ww.count = 0.0
+    for name, kw in (("res", {"res": 1.0}), ("res_corr", {"res_corr": 1.0}),
+                     ("diff", {"diff": 1.0}), ("var", {"var": 1.0})):
+        ww = copy.deepcopy(w); ww.res = ww.res_corr = ww.diff = ww.var = 0.0; ww.count = 0.0
         for k, v in kw.items():
             setattr(ww, k, v)
         _, o = one(ww)
-        key = {"res": "L_res", "res_corr": "L_res_corr", "diff": "L_diff"}[name]
+        key = {"res": "L_res", "res_corr": "L_res_corr", "diff": "L_diff", "var": "L_var"}[name]
         assert key in o, f"{name} 손실이 안 켜졌다: {sorted(o)}"
         out[f"{key}_value"] = o[key]
         out[f"{key}_gradnorm"] = o["grad_norm_total"]
