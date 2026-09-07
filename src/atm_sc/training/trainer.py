@@ -130,6 +130,7 @@ class TrainConfig:
     tier1_wd: float = 0.0             # tier1 pair 가중치 전용 weight decay (ridge lambda 대응)
     prior_local_dim: int = 0              # D-f: >0 이면 prior 가 **pair 의존** 국소 anatomy 를 받는다
     prior_local_rank: int = 0     # >0 이면 prior 국소 가지를 pair 인덱스 저랭크로
+    prior_local_center: bool = False  # prior 국소 입력에서 train 평균 ROI feature 를 뺀다
     tier1_stats: str | None = None        # train 전용 표준화 통계 npz (data/anat_tier1.pair_stats)
     pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
     anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
@@ -327,6 +328,53 @@ class Trainer:
         self._roi_cache = roi_pool(o3, self._roi_labels, self.model.n_roi)
         return self._roi_cache
 
+    @torch.no_grad()
+    def init_prior_template(self, subs, anat_fn, n_per_pair: int = 8, chunk: int = 4096) -> dict:
+        """prior 잔차 손실의 기준값 `_mu_bar` 를 train subject 전체의 **pair 별 posterior mu 평균**으로 채운다.
+
+        왜: prior_mean 에서 출발하는 EMA 는 pair 당 갱신이 드물어(64 pair/step, 3321 pair) 수백 step
+        동안 초기값 근처다. 그러면 r_q 가 "posterior 와 prior 의 pair 별 체계적 오프셋"(노름 ~5) 이
+        되는데 그건 pair 수준이라 중심화된 가지가 맞출 수 없고, 손실 바닥이 높아 subject 잔차
+        기울기가 묻힌다 (실측: 400 step 스모크 두 번 모두 가지 크기 0.033, 전체 성분 1e-4).
+        posterior 인코더는 동결이라(lr_vae_enc 0) 이 템플릿은 학습 중 낡지 않는다. train 만 쓴다.
+        """
+        m = self.model
+        from ..models.pair_anchor import upper_index
+        from ..models.roi_pair_embedding import canonical_pairs as _cp
+        n_pair = self._mu_bar.shape[0]
+        acc = torch.zeros_like(self._mu_bar); cnt = torch.zeros(n_pair, device=self.device)
+        was = m.training; m.eval()
+        rng = np.random.default_rng(self.cfg.seed + 77)
+        t0 = time.time(); n_str = 0
+        for sub in subs:
+            a = m.anatomy_forward(anat_fn(sub))
+            Ss, Ps = [], []
+            for k in range(sub.n_pairs):
+                S_gt, _ = sub.get_pair(int(k))
+                if S_gt.shape[0] == 0:
+                    continue
+                take = min(n_per_pair, S_gt.shape[0])
+                idx = torch.as_tensor(rng.choice(S_gt.shape[0], take, replace=False))
+                Ss.append(S_gt[idx]); Ps.append(torch.as_tensor(sub.pair_ids[k]).repeat(take, 1))
+            S_all, P_all = torch.cat(Ss).float(), torch.cat(Ps)
+            for i in range(0, len(S_all), chunk):
+                S = S_all[i:i + chunk].to(self.device); pr = _cp(P_all[i:i + chunk].to(self.device))
+                if m.anchor is not None:
+                    S = m.anchor.orient(S, pr)
+                c = m.condition(a, pr, local=self.cond_local(sub.sub, pr))
+                mu, _ = m.encode_streamlines(S, c)
+                pi = upper_index(pr[:, 0].long(), pr[:, 1].long(), int(m.n_roi))
+                acc.index_add_(0, pi, mu.float()); cnt.index_add_(0, pi, torch.ones(len(pi), device=self.device))
+                n_str += len(pi)
+        seen = cnt > 0
+        self._mu_bar[seen] = acc[seen] / cnt[seen, None]
+        m.train(was)
+        info = {"prior_template_pairs": int(seen.sum()), "prior_template_streamlines": int(n_str),
+                "prior_template_subjects": len(subs), "prior_template_sec": time.time() - t0}
+        assert info["prior_template_pairs"] > n_pair // 2, f"템플릿이 채워진 pair 가 너무 적다: {info}"
+        print(f"[trainer] prior 잔차 템플릿: {info}", flush=True)
+        return info
+
     def aux_local(self, sub: str, pairs: torch.Tensor) -> torch.Tensor | None:
         """edge_head / count_head_end 용 [K, aux_local_dim]. 본체는 cond_local 과 같다."""
         if not self.cfg.aux_local_dim:
@@ -471,7 +519,12 @@ class Trainer:
                     assert m.count_head_end is not None, "weight_mode 에 count 를 쓰려면 count head 가 필요"
                     # 균등하게 n_gen 개만 만들었지만, GT 는 이 pair 에 N_hat 개가 있다.
                     # N_hat/n_gen 을 곱하면 전체를 만든 것과 같은 기대값이 된다 (중요도 가중).
-                    nh = m.edge_log_counts_end(a_leaf, pc).exp() / max(cfg.n_gen_per_pair, 1)
+                    # aux 통로(A3)가 켜진 head 는 국소/티어1 입력이 필수다 -- 안 주면 assert 로 죽는다
+                    nh = m.edge_log_counts_end(
+                        a_leaf, pc,
+                        self.aux_local(subject.sub, pc) if m.count_head_end.local_dim else None,
+                        self.tier1_pairs(subject.sub, pc) if m.count_head_end.tier1_dim else None,
+                    ).exp() / max(cfg.n_gen_per_pair, 1)
                     w = nh if cfg.weight_mode == "count" else w * nh
                 return S, w
 
@@ -621,11 +674,24 @@ class Trainer:
                 from ..models.roi_pair_embedding import canonical_pairs as _cp
                 cpg = _cp(P_gt)
                 idx = upper_index(cpg[:, 0].long(), cpg[:, 1].long(), int(m.n_roi))
-                r_p = mu_p - m.prior_mean(P_gt)                     # 국소 가지 기여
-                r_q = (mu.detach() - self._mu_bar[idx]).detach()    # posterior 의 subject 잔차
+                # 타깃은 **pair 별 평균** posterior mu 다. 가닥 단위 mu 는 같은 pair 안에서도 가닥 모양에
+                # 따라 크게 흔들리는데 그건 subject feature 로 예측할 수 없는 잡음이라, 가닥 단위로
+                # 손실을 걸면 잡음이 손실을 지배해 가지가 거의 안 배운다 (실측: 2000 step 뒤 가지
+                # subject 성분 0.118 -> 0.023, 크기 base 의 7%). split-half 0.9956 도 32가닥 **평균**이었다.
+                n_pair = self._mu_bar.shape[0]
+                uniq, inv = torch.unique(idx, return_inverse=True)
+                cnt_u = torch.zeros(len(uniq), device=self.device).index_add_(
+                    0, inv, torch.ones(len(inv), device=self.device))
+                mu_pair = torch.zeros(len(uniq), mu.shape[1], device=self.device).index_add_(
+                    0, inv, mu.detach().float()) / cnt_u[:, None]
+                first = torch.zeros(len(uniq), dtype=torch.long, device=self.device).scatter_(
+                    0, inv.flip(0), torch.arange(len(inv) - 1, -1, -1, device=self.device))  # pair 별 첫 행
+                r_p = (mu_p - m.prior_mean(P_gt))[first]             # 국소 가지 기여 (pair 내에서 동일)
+                r_q = (mu_pair - self._mu_bar[uniq]).detach()        # pair 평균 posterior 의 subject 잔차
                 warm = step is not None and step < cfg.resid_warmup
                 out["prior_res_r"] = float(L.pearson(r_p.detach().flatten(), r_q.flatten()))
                 out["prior_res_gt_norm"] = float(r_q.norm(dim=1).mean())
+                out["prior_res_n_pairs"] = int(len(uniq))
                 if not warm:
                     if w.prior_res > 0:
                         l_pr = L.residual_smooth_l1(r_p, r_q, beta=cfg.resid_beta)
@@ -635,14 +701,9 @@ class Trainer:
                         l_prc = L.residual_corr_loss(r_p.flatten(), r_q.flatten())
                         tot_r = tot_r + w.prior_res_corr * l_prc
                         out["L_prior_res_corr"] = float(l_prc)
-                with torch.no_grad():                                # EMA 갱신 (pair 별 평균 먼저)
-                    n_pair = self._mu_bar.shape[0]
-                    acc = torch.zeros_like(self._mu_bar).index_add_(0, idx, mu.detach().float())
-                    cnt = torch.zeros(n_pair, device=self.device).index_add_(
-                        0, idx, torch.ones(len(idx), device=self.device))
-                    seen = cnt > 0
-                    self._mu_bar[seen] = ((1.0 - cfg.resid_momentum) * self._mu_bar[seen]
-                                          + cfg.resid_momentum * (acc[seen] / cnt[seen, None]))
+                with torch.no_grad():                                # EMA 갱신 (pair 별 평균으로)
+                    self._mu_bar[uniq] = ((1.0 - cfg.resid_momentum) * self._mu_bar[uniq]
+                                          + cfg.resid_momentum * mu_pair)
             if rec_route and V_gt is not None:
                 keep = (V_gt.sum(-1) > 0)            # synthetic streamline 은 GT 통과 정보가 없다 -> 제외
                 if bool(keep.any()):

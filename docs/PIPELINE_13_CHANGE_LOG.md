@@ -234,12 +234,14 @@
 
 ### M19. `edge_head` / `count_head_end` 에 국소+티어1 통로 (`a3_aux` phase, `count_end` 가중치 분리)
 - 왜: val 10명 edge 선택 Jaccard **0.9896**, 확률 subject 성분 **1.6e-06** — "어떤 연결이 있는가"에서 개인차가 전부 지워진다. `count_end` 는 `w.count` 를 공유해 잔차 실험에서 **한 step 도 학습되지 않았다**.
-- 스모크 30 step: Jaccard 0.996 → 0.927, subject 성분 1.6e-06 → 1.8e-03. 본 학습(A3) 결과: 측정 중.
+- **본 학습 A3 (2000 step, val 10명)**: edge Jaccard **0.9951 → 0.8373**, 확률 subject 성분 **3.9e-06 → 7.0e-03**, 선택 pair 수 1821~1830 → 1768~1827. count_end r **0.867** / CCC 0.832 (이전 0.57, 균등 0.71). **통과.**
 
 ### M20. subject 조건부 prior — 두 번 실패, 세 번째 설계
 - D-f (공유 MLP): prior mu subject 성분 **0.000154**. D-f' (pair 별 저랭크 [512→4→128], 1.7M): **0.000525**. 신호 상한은 posterior mu 기준 0.566 이고 split-half r=0.9956 으로 **재현되는 진짜 신호**다.
 - 진단: 용량이 아니라 손실. pair 평균이 `L_prior` 를 압도해 subject 잔차 기울기가 묻힌다 — count head 에서 템플릿을 뺀 것과 같은 상황.
-- D-f'' (`prior_res`: `r_q = mu_q − EMA_pair[mu_q]`, `r_p = mu_p − prior_mean`): 스모크 260 step 에서 `prior_res_r` 0.07 → **0.21**. 본 학습 결과: 측정 중.
+- D-f'' (`prior_res`): 본 학습 뒤 subject 성분 **0.000189 — 실패**. 스모크의 `prior_res_r` 0.21 은 EMA 지연(pair 오프셋 노름 ~5)을 맞춘 허수였다.
+- 잡은 원인 4개 (각각 실측으로 확인): ① 가지 출력의 98% 가 pair 수준 → 입력 **중심화** (가지 subject 성분 0.02 → 0.12); ② EMA 가 pair 당 ~8회 갱신 → train 144명 pair 별 posterior mu **템플릿**으로 초기화 (타깃 노름 4.9 → 3.3, `prior_res_r` 0.2 → 0 = 이전 값이 허수였음을 확인); ③ 중심화 입력 크기 ~0.02/dim 이고 U 가 lr 3e-5 그룹 → **train std 표준화** + U 를 lr 1e-3 그룹으로 (가지 subject 성분 0.13 → 0.56); ④ step 당 64 pair 만 봄 → 256 으로.
+- **D-f''' 본 학습 (2000 step)**: prior mu subject 성분 **0.00149** — 원래(0.000154)의 **10배**지만 게이트 0.005·목표 0.05 미달. 가지 크기 0.117 로 컸는데 subject 성분이 0.56 → 0.13 으로 희석 (공유 MLP 가지가 pair 수준 출력을 키운 것으로 추정). **부분 성공으로 채택**하고 D4 로 진행 — 생성 경로 개인차는 A3·잔차 배분·cond FiLM 이 주로 낸다.
 - 그 전에 잡은 것: `prior: 0.0` 이라 prior_local 이 학습 자체가 안 되던 것, 학습된 prior 를 "0-init 이어야 한다"고 우기던 낡은 자기검증, `resid_stats` 누락, 잘못된 조상(d3_joint) 에서 resume.
 
 ### M21. 구조 상속 (`run.py`): resume checkpoint 의 가지를 config 대신 checkpoint 에서 읽는다

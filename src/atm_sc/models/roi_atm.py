@@ -271,6 +271,7 @@ class ROIPairATM(nn.Module):
         # prior 의 pair 별 저랭크 가중치도 같은 weight decay 를 받아야 한다 (1.7M / 144명).
         if getattr(self.pair_emb, "prior_local_w", None) is not None:
             tier1_pair.append(self.pair_emb.prior_local_w)
+            tier1_pair.extend(self.pair_emb.prior_local_u.parameters())   # U 도 같은 LR (heads 의 3e-5 로는 안 움직인다)
         ps_ids |= {id(p) for p in tier1_pair}
         groups = {"t1_encoder": list(self.atm.unet_trainable_parameters()),
                   "vae_encoder": [] if self.trainable == "decoder"

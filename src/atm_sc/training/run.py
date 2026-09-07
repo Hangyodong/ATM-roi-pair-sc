@@ -456,6 +456,24 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
     start_step, opt_state, rng_state = 0, None, None
     if resume is not None:
         model.load_checkpoint(sd["model"])
+    if getattr(cfg, "prior_local_center", False) and getattr(model.pair_emb, "prior_local_w", None) is not None:
+        # train subject 의 ROI feature 평균 (디스크 캐시 = 동결 인코더 기준). 누수 없음: train 만.
+        from ..data.local_feats import load_roi_feats
+        acc = None
+        for s_ in subjects:
+            r_ = load_roi_feats(s_, t1_source, device, n_roi=n_roi).float()
+            acc = r_.clone() if acc is None else acc + r_
+        rm = acc / len(subjects)
+        sq = None
+        for s_ in subjects:
+            d_ = (load_roi_feats(s_, t1_source, device, n_roi=n_roi).float() - rm).pow(2)
+            sq = d_ if sq is None else sq + d_
+        rs = (sq / max(len(subjects) - 1, 1)).sqrt().clamp(min=1e-3)     # 상수 축(아틀라스 공유 성분) 바닥
+        assert rm.shape == tuple(model.pair_emb.prior_local_roi_mean.shape), (rm.shape, model.pair_emb.prior_local_roi_mean.shape)
+        assert float(rm.abs().sum()) > 0 and torch.isfinite(rm).all() and torch.isfinite(rs).all(), "ROI 평균/std 가 0/NaN"
+        model.pair_emb.prior_local_roi_mean.copy_(rm)
+        model.pair_emb.prior_local_roi_std.copy_(rs)
+        print(f"[{phase}] prior 국소 입력 표준화: train {len(subjects)}명 ROI 평균 rms {float(rm.pow(2).mean().sqrt()):.4f}, std 중앙값 {float(rs.median()):.5f}", flush=True)
         if resume_optimizer and sd.get("phase") == phase and "optimizer" in sd and sd.get("step", 0) < max_steps:
             start_step, opt_state, rng_state = int(sd["step"]), sd["optimizer"], sd.get("rng")
             print(f"[{phase}] resume: step {start_step} 부터 이어서 ({resume.name})", flush=True)
@@ -495,10 +513,14 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
         rdata = recon_batches(subs[:n_recal], rf, None, cfg.n_gt_per_pair,
                               np.random.default_rng(cfg.seed + 7), pair_sampling=cfg.pair_sampling)
         n_bn = dc.bn_recalibrate(model, None, rdata, batch=cfg.chunk)
-        n_str = int(sum(len(S) for S, _, _ in rdata))
+        n_str = int(sum(len(S) for S, _, _, _ in rdata))
         assert n_bn > 0 and n_str > 0, (n_bn, n_str)
         print(f"[{phase}] BN 재보정: {n_bn}개 BatchNorm1d, {n_recal}명 x "
               f"{n_str // n_recal} 가닥 ({time.time() - t_bn:.0f}s)", flush=True)
+
+    anat_fn = lambda x: feats[x.sub] if feats[x.sub] is not None else t1_input(model, x.sub, t1_source)
+    if getattr(tr, "_mu_bar", None) is not None and start_step == 0:
+        tr.init_prior_template(subs, anat_fn, n_per_pair=cfg.n_gt_per_pair)
 
     log = open(out_dir / "log.jsonl", "a")
     rng = np.random.default_rng(cfg.seed + 1000)          # subject 선택용 (Trainer 내부 rng 와 분리)

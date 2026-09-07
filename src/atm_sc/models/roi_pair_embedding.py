@@ -116,6 +116,18 @@ class ROIPairEmbedding(nn.Module):
             self.prior_local_u = nn.Linear(self.prior_local_dim, self.prior_local_rank, bias=False)
             self.prior_local_w = nn.Parameter(
                 torch.zeros(n_pair, self.prior_local_rank, 2 * latent_dim))   # 0-init -> bit-exact 시작
+            # 입력 중심화용 train 평균 ROI feature [n_roi, D/2]. 왜 -- local = [f_i, f_j] 는 대부분
+            # pair 정체성이라(실측: 가지 출력의 subject 성분 2%, 98% 가 pair 수준) 가지가 pair 평균
+            # 드리프트를 맞추는 데 용량을 다 썼다. 평균을 빼면 bias 가 없는 이 가지는 평균 입력에서
+            # 출력이 정확히 0 이라 pair 수준을 표현할 수 없고, subject 편차로만 손실을 줄일 수 있다.
+            # 0 이면 중심화 없음(구 checkpoint 호환). run.py 가 train subject 로 채운다.
+            self.register_buffer("prior_local_roi_mean",
+                                 torch.zeros(self.prior_local_n_roi, self.prior_local_dim // 2))
+            # 표준화용 train std. 왜 -- 중심화만 하면 입력 크기가 ~0.02/dim (subject 성분이 7% 라)
+            # 이라 u = U(lc) 가 극소이고, W 가 |max| 0.97 까지 커져도 출력이 base 의 3% 를 못 넘는다
+            # (실측, 22:06 run). 티어1 의 pair_stats 표준화와 같은 처방. 1 이면 표준화 없음.
+            self.register_buffer("prior_local_roi_std",
+                                 torch.ones(self.prior_local_n_roi, self.prior_local_dim // 2))
         self.prior_use_anatomy = bool(prior_use_anatomy)
         self.prior_anatomy = nn.Linear(cond_dim, 2 * latent_dim)
         nn.init.zeros_(self.prior_anatomy.weight); nn.init.zeros_(self.prior_anatomy.bias)
@@ -165,7 +177,14 @@ class ROIPairEmbedding(nn.Module):
             if self.prior_local_w is not None:
                 from .pair_anchor import upper_index
                 idx = upper_index(pairs[:, 0].long(), pairs[:, 1].long(), self.prior_local_n_roi)
-                u = self.prior_local_u(local)                       # [K, rank]
+                lc = local
+                if bool(self.prior_local_roi_mean.abs().sum() > 0):
+                    rm = self.prior_local_roi_mean
+                    sd_ = self.prior_local_roi_std
+                    i_, j_ = pairs[:, 0].long(), pairs[:, 1].long()
+                    lc = ((local - torch.cat([rm[i_], rm[j_]], dim=-1))
+                          / torch.cat([sd_[i_], sd_[j_]], dim=-1))
+                u = self.prior_local_u(lc)                          # [K, rank]  (중심화 입력)
                 dl = dl + torch.einsum("kr,krd->kd", u, self.prior_local_w[idx])
             mu = mu + dl[:, :self.latent_dim]
             ls = ls + dl[:, self.latent_dim:]

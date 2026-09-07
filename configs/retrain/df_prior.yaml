@@ -28,7 +28,7 @@ unet_level: none          # UNet 동결 -> anatomy 는 디스크 캐시 (W4 프�
 t1_source: rigid
 in_channels: 2
 template: true
-resume: outputs/checkpoints/retrain/e4_unet_D_local_t1fp0.1/a1_resid_step3000.pt  # E8 (E 축 승자)
+resume: /scratch/home/wog3597/ATM/outputs/checkpoints/retrain/a3_aux/a3_aux_step2000.pt  # A3 (edge/count_end 학습 완료)
 log_every: 50
 save_every: 500
 
@@ -49,6 +49,11 @@ train:
   cudnn_benchmark: true
   sc_groups: block
   resid_beta: 1.0
+  # prior 잔차 손실은 recon 배치의 pair 만 본다. 기본 64 pair/step 이면 3321 개 pair 별 가중치가
+  # 2000 step 에 pair 당 ~38 번밖에 갱신되지 않는다 (실측: 템플릿 초기화 뒤 prior_res_r ~0).
+  # count head 의 tier1_w 는 매 step 3321 pair 전부를 봐서 됐다. 여기서도 pair 수를 올린다.
+  gt_pairs_per_step: 256
+  n_gt_per_pair: 8
   # res/res_corr/diff 손실은 train 전용 log1p 템플릿을 요구한다 (data/sc_template.py).
   # 54번 드라이버는 이걸 코드에서 넣어주지만 49_d3_joint 는 config 에서 읽는다.
   resid_stats: outputs/cache/sc_template_stats.npz
@@ -56,7 +61,9 @@ train:
   count_tier1_pair: true
   tier1_stats: outputs/cache/anat_tier1_pair_stats.npz
   prior_local_dim: 512    # D-f: pair 의존 subject 조건부 prior
-  prior_local_rank: 4     # ★ 공유 MLP 는 실패했다 (신호 0.566 중 0.000154 만 학습).
+  prior_local_rank: 4
+  prior_local_center: true  # ★ 실측: 중심화 전 가지 출력의 subject 성분 2% (pair 수준 98%)
+  resid_momentum: 0.05      # prior EMA 가 pair 드리프트를 더 빨리 따라가게     
                           # pair 별 저랭크 [512->4->128], 3321*4*128 = 1.7M.
   tier1_wd: 0.1           # 1.7M / 144명 -- 정규화 없이는 과적합한다
   tier1_lr: 1.0e-03
