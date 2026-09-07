@@ -49,7 +49,7 @@ upstream 구조상 `global_avg_pool` 은 `rigid_UNet.forward` 안에 있다 (`mo
 | 이 프로젝트 전역 뇌 박스 | 152 × 189 × 163 | 4.68e6 |
 | upstream 번들 박스 (중앙, `supp/*_coords_*.npy`) | 83 × 121 × 100 | 1.17e6 |
 | **실제 ROI 쌍의 GT 범위 (중앙)** | **43 × 71 × 61** | **1.67e5** |
-| 앵커 박스 (valid 1,569개) | — | **전역 대비 39배 축소** |
+| 앵커 박스 (valid 2,767개) | — | **전역 대비 23.6배 축소** (전체 중앙 19.8배) |
 
 디코더 복원은 3.08 mm 로 GT 잡음 바닥(pair 천장 MDF 3.92 mm)에 이미 닿아 있다 → **용량 문제 아님**
 (W1-d 결론 유효). 피해자는 **prior** 다: 좌표가 전뇌 절대값이라 64-d `z` 가 "3,321 쌍 중 어느 것 +
@@ -90,9 +90,9 @@ upstream 구조상 `global_avg_pool` 은 `rigid_UNet.forward` 안에 있다 (`mo
 | 단계 | 내용 | 파일 | 상태 |
 |---|---|---|---|
 | **D-a** | `decode_raw` 분리 (좌표 역정규화를 디코더에서 떼어냄) | `models/atm_adapter.py` | 완료 |
-| **D-b** | 앵커 상수 생성 (train 144명 그룹 평균 경로 + 반범위) | `scripts/56_pair_anchors.py` | 완료 |
+| **D-b** | 앵커 상수 생성 (train 144명 그룹 평균 경로 + 반범위) | `scripts/56_pair_anchors.py` | 완료 (valid 2,767/3,321, 기여 subject 중앙 68명) |
 | **D-c** | `PairAnchor` + alpha 램프업 학습 | `models/pair_anchor.py`, `configs/retrain/d4_anchor.yaml`, `scripts/57_d4_anchor.py` | **실행 중** |
-| **D-d** | invalid pair(53%) 처리 — pair 별 alpha 또는 앵커 개선 | — | D-c 결과에 따라 |
+| **D-d** | invalid pair(16.7%) 처리 — pair 별 alpha 또는 앵커 개선 | — | D-c 결과에 따라 |
 | **D-e** | prior 재구조화 (`arch_additive`) — 좁아진 좌표계 위에서 | — | D-c 이후 |
 
 ### 재매개화
@@ -147,6 +147,7 @@ train 모드 값은 BN 때문에 추론에서 성립하지 않는다 (M6 참조)
 | **val 국소 feature 부재** | `s1b_feats` 캐시가 train+test 175명뿐이라 첫 국소 arm 이 eval 훅에서 죽었다 | val 31명 추출 후 재실행. assert 가 잡아준 경우 |
 | **T1 강도 미정규화** | 티어 1 의 `t1_mean` subject CV 2.17 이 이상해 조사 → 뇌 내부 중앙값이 **163~63,824 (390배, CV 1.635)**. 스캐너 스케일이지 해부가 아니다 | 중앙값 정규화, 스케일은 `t1_scale` 교란변수로 분리, 206명 재추출 |
 | **`half` buffer 이름 충돌** | `nn.Module.half()` 와 겹쳐 `register_buffer` 가 `KeyError` | `half_range` 로 개명 |
+| **경합 상태로 구버전 앵커 학습** | D4 가 앵커 생성이 끝나기 전 파일을 읽어 valid 1,569 짜리 중간본으로 1,250 step 을 돌았다. 자기검증 로그에 찍힌 `anchor_valid` 를 최종본과 대조해 발견 | 중단 후 valid 2,767 로 재시작. **산출물을 소비하기 전에 생산이 끝났는지 확인해야 한다** |
 
 두 번째가 가장 위험했다 — 정규화 없이 뒀으면 ridge 가 해부 대신 **획득 조건**을 학습하고,
 사이트 효과가 SC 와 상관되면 **가짜 양성**이 나왔을 것이다.
