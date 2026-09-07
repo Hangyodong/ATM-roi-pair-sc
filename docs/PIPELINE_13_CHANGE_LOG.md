@@ -253,3 +253,22 @@
 ### 남은 것 (파이프라인 순서)
 D-f'' → A3 → D4(좌표 상자, 게이트 ≤4.0mm 미달 상태) → J1 joint(낮은 LR) → A/B(val) → **test 1회**.
 코드 미완: 최적 step checkpoint 보존, `weight_head` 제거.
+
+### M23. D4 앵커 폐기, J1 no-anchor 채택 (2026-09-08 00:00~01:00)
+- D4 (앵커 alpha 0→1 램프, 2500 step): alpha=1 recon **25.8 mm** (게이트 4.0, 이전 시도 12.4). 파이프라인이 이 게이트를 안 걸러 J1 이 그 위에서 돌아 recon 31.8→33.2 mm — **폐기**. `run_pipeline3.sh` 에 D4 게이트 부재 (TODO).
+- J1 no-anchor (D-f''' 위, 전 LR 1/3, 1000 step): recon 4.53→**4.41 mm** (게이트 4.6 통과), valid_conn 0.18→0.22. **최종 checkpoint** = `j1_joint_noanchor/d3_joint_step1000.pt`.
+- A/B (val 12명): temp 0.2 + WM 필터 0.3 이 Pareto (dice 0.512, overreach 1.02, retain 0.72). SC r 은 temp 에 둔감 (0.70~0.73).
+- gain 재보정 (val 12명, 6만 가닥): gain 1 에서 alloc `inter_subj` 0.815 < GT 0.902 → **gain 1** 채택. alloc `resid_r` ≈ 0, count head `resid_r` 0.115.
+- 국소 통로 누락 호출부 3곳 더 (57 selfcheck `condition`, `gen_chunk` 배분, `generate_by_count`).
+
+### M24. test 1회 (31명, 46만 가닥/명, gain 1) — `outputs/eval/final_d3_joint_step1000.json`, 그림 `outputs/figs/test_sc_gt_vs_*.png`
+
+| 경로 | r (절대) | `resid_r` | `inter_subj` (GT 0.896) |
+|---|---|---|---|
+| alloc (최종 추론) | 0.576 (0.51~0.67) | **−0.016** | 0.9715 |
+| generated (균등) | 0.729 | 0.010 | 0.998 |
+| count head | — | **0.084** | 0.991 |
+| 그룹 템플릿 | **0.945** | — | — |
+
+- **판정**: 생성 경로는 31명이 동일하진 않지만(0.9715 < 균등 0.998) 그 차이는 GT 잔차와 무관하다(`resid_r` ≈ 0). val 12명·6만 가닥에서 본 퍼짐(0.815)은 대부분 가닥 표본 잡음이었다 — 가닥을 46만으로 올리자 0.97 로 돌아왔다. 개인차 정보는 **count head 경로에만** 있다 (`resid_r` 0.084, val 0.07~0.115 와 일치). 절대 SC 는 여전히 템플릿(0.945)을 아무도 못 넘는다 (0/31).
+- 오늘의 순효과: count head 개인차 0.034→0.08 (test), edge 선택이 subject 별로 갈라짐(Jaccard 0.995→0.837), prior 10배 — **그러나 tractogram 으로 가는 길에서 그 정보가 SC 로 전달되지 않는다.** 다음 병목은 "count head 가 아는 것을 생성 경로가 쓰게 하는 것" 이다 (배분은 count_end 가 정하고, 잔차 변조는 gain 1 에서 효과가 작다).
