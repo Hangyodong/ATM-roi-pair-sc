@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from atm_sc.data.dataset import ROIPairSubject                          # noqa: E402
 from atm_sc.data.paths import ATLAS, CACHE                              # noqa: E402
 from atm_sc.evaluation.balance_metrics import bundle_geometry_metrics   # noqa: E402
-from atm_sc.inference.generate_sc import select_pairs, tractogram_sc    # noqa: E402
+from atm_sc.inference.generate_sc import aux_feats_for, select_pairs, tractogram_sc    # noqa: E402
 from atm_sc.models.roi_atm import from_checkpoint                       # noqa: E402
 from atm_sc.models.roi_pair_embedding import canonical_pairs            # noqa: E402
 from atm_sc.training.run import anatomy_feature                         # noqa: E402
@@ -41,7 +41,12 @@ def gen_with_temp(model, a, pairs_t, n_per_pair, s, seed, local_roi=None):
     pr = canonical_pairs(pairs_t).repeat_interleave(n_per_pair, dim=0)
     g = torch.Generator(device=model.device); g.manual_seed(seed)
     with torch.inference_mode():
-        mu, ls = model.prior_params(pr, anatomy=None if not model.pair_emb.prior_use_anatomy else a)
+        pl = None
+        if model.pair_emb.prior_local is not None:      # subject 조건부 prior (D-f) 는 국소 입력이 필수
+            from atm_sc.data.local_feats import pair_local
+            assert local_roi is not None, "prior 국소 통로가 켜졌는데 local_roi 가 없다"
+            pl = pair_local(local_roi, pr)
+        mu, ls = model.prior_params(pr, anatomy=None if not model.pair_emb.prior_use_anatomy else a, local=pl)
         eps = torch.randn(mu.shape, generator=g, device=model.device)
         z = mu + s * torch.exp(ls) * eps
         S, w, prr = model.generate(a, pairs_t, n_per_pair, generator=g, z=z, local_roi=local_roi)
@@ -82,7 +87,8 @@ def main():
             if m.pair_emb.local_dim or m.pair_emb.prior_local is not None:
                 from atm_sc.data.local_feats import load_roi_feats
                 lr = load_roi_feats(sub, src, m.device, n_roi=m.n_roi)
-            pairs, _ = select_pairs(m, feat, int(m.n_roi))
+            al, at = aux_feats_for(m, sub, src)
+            pairs, _ = select_pairs(m, feat, int(m.n_roi), local=al, tier1=at)
             S, w, pr = gen_with_temp(m, feat, torch.as_tensor(np.asarray(pairs), device=m.device),
                                      a.n_per_pair, s_temp, seed=0, local_roi=lr)
             gt = np.asarray(ROIPairSubject(sub).sc_mat, np.float64)

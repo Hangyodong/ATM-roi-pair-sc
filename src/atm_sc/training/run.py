@@ -64,6 +64,9 @@ PHASES = {                                # 최종 전략 §7
     # A1 잔차 타깃 (실험 A): count head 하나만 학습한다. 생성도 복원도 없어 step 이 싸고,
     # 개인차 supervision 을 직접 거는 유일한 구성이다. 판정은 val 의 `resid_r`.
     "a1_resid": {"count"},
+    # A3: 추론에서 pair 를 고르고(edge_head) 가닥 수를 정하는(count_head_end) 두 head 를
+    # subject feature 위에서 학습한다. 실측 edge Jaccard 0.9896 -> 개인차가 여기서 지워졌다.
+    "a3_aux": {"count", "edge"},
     # D3 joint (W3-a): D1 이 복원만 학습해 디코더를 날카롭게 만든 결과 **생성 경로가 무너졌다**
     # (C13: valid_conn 0.367 -> 0.042). posterior drift 는 아니었고(오프셋 5.27 -> 3.51 로 오히려 감소),
     # prior 가 뽑는 영역이 더 이상 디코더가 정확한 영역이 아니게 된 것이다. 그래서 순차 phase 로
@@ -247,7 +250,8 @@ def individuality_metrics(model: ROIPairATM, subjects: list[str], n_subj: int = 
                 pm = rng.permutation(len(gt_b))
                 ref, other = gt_b[pm[:h]], gt_b[pm[h:2 * h]]
                 Pk = torch.as_tensor(pid[k][None], device=model.device)
-                S, _, _ = model.generate(feats[si], Pk, h, generator=g)
+                S, _, _ = model.generate(feats[si], Pk, h, generator=g,
+                                         local_roi=roi_feats_if_needed(model, subj.sub, source))
                 dices.append(bundle_geometry_metrics(S.cpu().numpy().astype(np.float32), ref)["dice"])
                 # 천장: 같은 pair 의 **실제** streamline 두 표본끼리. dice 는 번들 크기에 민감하므로
                 # 생성쪽과 같은 조건(h개 vs 같은 ref h개)으로 재야 비교가 된다.
@@ -309,21 +313,46 @@ def recon_batches(subjects: list[ROIPairSubject], feats: dict, n_pairs: int | No
         assert S.ndim == 3 and S.shape[1:] == (128, 3), S.shape
         assert S.shape[0] == P.shape[0] and P.shape[1] == 2, (S.shape, P.shape)
         assert torch.isfinite(S).all(), f"{sub.sub}: GT streamline 에 NaN/Inf"
-        out.append((S, P, feat))
+        out.append((S, P, feat, sub.sub))
     assert out, "복원 배치를 만들 subject 가 없다"
     return out
 
 
+def roi_feats_if_needed(model, sub: str, source: str):
+    """모델이 국소 통로(cond FiLM 또는 prior)를 갖고 있으면 ROI 국소 feature 를 만든다.
+
+    generate() 가 local_roi 를 요구하는데 옛 호출부들이 안 넘겨서 조용히 죽던 자리다.
+    통로가 없으면 None 을 돌려 기존 동작 그대로다."""
+    pe = model.pair_emb
+    if not (pe.local_dim or pe.prior_local is not None):
+        return None
+    from ..data.local_feats import load_roi_feats
+    return load_roi_feats(sub, source, model.device, n_roi=model.n_roi)
+
+
 @torch.no_grad()
-def _recon_rmse(model, data, batch: int = 2048) -> float:
+def _recon_rmse(model, data, batch: int = 2048, source: str = "rigid") -> float:
     """복원 RMSE (mm) = sqrt(mean_points ||rec - gt||^2). 모드(train/eval)는 호출측이 정한다.
     z 는 mu (샘플링 잡음 없이) -- trainer 의 값은 reparameterize 라 약간 더 크다."""
     tot, n = 0.0, 0
-    for S, P, feat in data:
+    # 디코더 조건에 국소 통로(cond_local_dim)가 켜져 있으면 여기서도 줘야 한다. 예전에는 안 줘서
+    # cond_local_dim > 0 인 checkpoint 를 평가하면 pair_emb 의 assert 로 죽었다 -- 학습은 끝내 놓고
+    # 평가에서 죽는 바람에 D-f 가 실패로 보였다 (실제로는 checkpoint 가 저장돼 있었다).
+    cld = int(getattr(model.pair_emb, "local_dim", 0) or 0)
+    for S, P, feat, sub_id in data:
+        roi = None
+        if cld:
+            from ..data.local_feats import load_roi_feats
+            roi = load_roi_feats(sub_id, source, model.device, n_roi=model.n_roi)
         for i in range(0, len(S), batch):
             s = S[i:i + batch].to(model.device)
             pr = P[i:i + batch].to(model.device)
-            c = model.condition(feat, pr)
+            loc = None
+            if roi is not None:
+                from ..data.local_feats import pair_local
+                from ..models.roi_pair_embedding import canonical_pairs
+                loc = pair_local(roi, canonical_pairs(pr))
+            c = model.condition(feat, pr, local=loc)
             mu, _ = model.encode_streamlines(s, c)
             rec = model.decode(mu, c, pr)
             assert rec.shape == s.shape, (rec.shape, s.shape)
@@ -360,12 +389,12 @@ def recon_rmse_metrics(model, subjects: list[str], n_subj: int = 3, n_pairs: int
     was_training = model.training
     st = dc.bn_state(model)                       # train 모드 pass 가 running 통계를 바꾼다
     model.eval()
-    out = {"recon_rmse_eval_mm": _recon_rmse(model, data, batch)}
+    out = {"recon_rmse_eval_mm": _recon_rmse(model, data, batch, source=source)}
     model.train()
-    out["recon_rmse_train_mm"] = _recon_rmse(model, data, batch)
+    out["recon_rmse_train_mm"] = _recon_rmse(model, data, batch, source=source)
     dc.bn_restore(model, st)
     out["recon_n_subj"] = len(subs)
-    out["recon_n_streamlines"] = int(sum(len(S) for S, _, _ in data))
+    out["recon_n_streamlines"] = int(sum(len(S) for S, _, _, _ in data))
     out["recon_bn_gap_mm"] = out["recon_rmse_eval_mm"] - out["recon_rmse_train_mm"]
     assert all(np.isfinite(v) for v in (out["recon_rmse_eval_mm"], out["recon_rmse_train_mm"])), out
     model.train(was_training)
@@ -397,18 +426,35 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
 
     subs = [ROIPairSubject(s) for s in subjects]
     n_roi = subs[0].n_roi
+    # resume 하는 checkpoint 의 **구조**(어떤 가지가 있는지)를 config 보다 먼저 읽는다.
+    # 왜: 단계마다 새 가지가 생기는데(count_local -> tier1 -> aux -> prior_local_rank ...) 뒤 단계
+    # config 가 그걸 전부 다시 선언해야 했다. 하나만 빠져도 "checkpoint 에만 있는 키" 로 죽는다 --
+    # A3 가 그렇게 죽었고(20:20) D4 는 그 후폭풍으로 죽었다. config 가 0/False 로 둔 구조 항목은
+    # checkpoint 값을 물려받는다. config 가 **명시**한 값은 그대로 둔다 (가지를 새로 여는 경우).
+    sd = None
+    if resume is not None:
+        sd = torch.load(resume, map_location=device, weights_only=False)
+        for k in ("count_local_dim", "cond_local_dim", "count_tier1_dim", "count_tier1_pair",
+                  "aux_local_dim", "aux_tier1_dim", "prior_local_dim", "prior_local_rank",
+                  "pair_anchor", "prior_use_anatomy"):
+            if k in sd and not getattr(cfg, k, None) and sd[k]:
+                setattr(cfg, k, sd[k])
+                print(f"[{phase}] 구조 상속: {k} = {sd[k]} (checkpoint {Path(resume).name})", flush=True)
     model = ROIPairATM(n_roi=n_roi, init_bundle=init_bundle, device=device, trainable=trainable,
                        unet_level=unet_level, in_channels=in_channels, template=template,
                        count_local_dim=int(getattr(cfg, "count_local_dim", 0)),
                        cond_local_dim=int(getattr(cfg, "cond_local_dim", 0)),
                        count_tier1_dim=int(getattr(cfg, "count_tier1_dim", 0)),
+                       count_tier1_pair=bool(getattr(cfg, "count_tier1_pair", False)),
+                       aux_local_dim=int(getattr(cfg, "aux_local_dim", 0)),
+                       aux_tier1_dim=int(getattr(cfg, "aux_tier1_dim", 0)),
+                       prior_local_rank=int(getattr(cfg, "prior_local_rank", 0)),
                        prior_local_dim=int(getattr(cfg, "prior_local_dim", 0)),
                        pair_anchor=getattr(cfg, "pair_anchor", None),
                        anchor_alpha=float(getattr(cfg, "anchor_alpha", 0.0)))
     unet_level = model.unet_level
     start_step, opt_state, rng_state = 0, None, None
     if resume is not None:
-        sd = torch.load(resume, map_location=device, weights_only=False)
         model.load_checkpoint(sd["model"])
         if resume_optimizer and sd.get("phase") == phase and "optimizer" in sd and sd.get("step", 0) < max_steps:
             start_step, opt_state, rng_state = int(sd["step"]), sd["optimizer"], sd.get("rng")
@@ -472,8 +518,13 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                                        if model.count_head is not None else 0),
                     "cond_local_dim": model.pair_emb.local_dim,
                     "prior_local_dim": model.pair_emb.prior_local_dim,
+                    "prior_local_rank": getattr(model.pair_emb, "prior_local_rank", 0),
                     "count_tier1_dim": (model.count_head.tier1_dim
                                        if model.count_head is not None else 0),
+                    "count_tier1_pair": bool(getattr(model.count_head, "tier1_w", None) is not None
+                                            if model.count_head is not None else False),
+                    "aux_local_dim": (model.edge_head.local_dim if model.edge_head is not None else 0),
+                    "aux_tier1_dim": (model.edge_head.tier1_dim if model.edge_head is not None else 0),
                     "pair_anchor": bool(model.anchor is not None),
                     "anchor_alpha": (float(model.anchor.alpha)
                                      if model.anchor is not None else 0.0),

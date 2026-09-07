@@ -186,6 +186,7 @@ def resid_eval(model, subs: list[str], stats: dict, t1_source: str, init_bundle:
 def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> dict:
     ld = int(getattr(built["cfg"], "count_local_dim", 0) or 0)
     td = int(getattr(built["cfg"], "count_tier1_dim", 0) or 0)
+    tp = bool(getattr(built["cfg"], "count_tier1_pair", False))
     out = {}
     # (1) 누수: 템플릿은 train 만으로 만들어졌는가
     used = set(stats["subjects"].tolist())
@@ -201,7 +202,8 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     ea = EndpointAssigner(np.load(CACHE / "dist_maps.npy"), nib.load(ATLAS).affine, tau=0.5,
                           device=device, d_bg=None if cfg.sc_mode == "endpoint" else 2.0)
     s0, s1 = ROIPairSubject(built["subjects"][0]), ROIPairSubject(built["subjects"][1])
-    m0, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td)
+    m0, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td,
+                            count_tier1_pair=tp)
     ib = built["init_bundle"]
     a0 = anatomy_feature(m0, s0.sub, ib, source=built["t1_source"])
     a1 = anatomy_feature(m0, s1.sub, ib, source=built["t1_source"])
@@ -209,7 +211,8 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     torch.cuda.empty_cache()
 
     def one(weights):
-        mm, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td)
+        mm, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td,
+                            count_tier1_pair=tp)
         cc = copy.deepcopy(cfg); cc.active = {"count"}
         tr = Trainer(mm, ea, cc, weights)
         o = tr.step(s0, a0, partner=(s1, a1) if (weights.diff > 0 or weights.var > 0) else None)
@@ -249,14 +252,22 @@ def selfcheck(built: dict, stats: dict, train_subs: list[str], device: str) -> d
     # (5) 국소 가지는 0-init -- 켜도 시작 예측이 전역 전용과 bit-exact 여야 한다
     if ld:
         R = int(stats["n_roi"])
-        mg, _ = from_checkpoint(built["resume"], device=device)                    # 전역 전용
-        ml, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld, count_tier1_dim=td)  # 국소 가지 추가
+        # 이 검사는 **국소 가지**만 본다. 티어 1 가지가 켜져 있으면 양쪽에 똑같이 달아
+        # 국소의 효과만 분리한다 (안 그러면 tier1 이 없다는 assert 에 걸린다).
+        mg, _ = from_checkpoint(built["resume"], device=device, count_tier1_dim=td)
+        ml, _ = from_checkpoint(built["resume"], device=device, count_local_dim=ld,
+                                count_tier1_dim=td)
         iu = np.triu_indices(R, 1)
         Pt = torch.as_tensor(np.stack(iu, 1).astype(np.int64), device=device)
         fr = load_roi_feats(s0.sub, built["t1_source"], device, n_roi=R)
+        t1v = None
+        if td:
+            from atm_sc.data.anat_tier1 import pair_input, pair_stats as _ps2
+            t1v = torch.as_tensor(pair_input(s0.sub, _ps2(built["subjects"]), built["t1_source"]),
+                                  device=device)
         with torch.no_grad():
-            v0 = mg.edge_log_counts(a0, Pt)
-            v1 = ml.edge_log_counts(a0, Pt, pair_local(fr, Pt))
+            v0 = mg.edge_log_counts(a0, Pt, None, t1v)
+            v1 = ml.edge_log_counts(a0, Pt, pair_local(fr, Pt), t1v)
         d = float((v0 - v1).abs().max())
         out["local_zero_init_max_abs_diff"] = d
         assert d == 0.0, f"국소 가지 0-init 인데 예측이 바뀐다 (max|diff| = {d:.3e})"
@@ -281,6 +292,13 @@ def main():
     ap.add_argument("--selfcheck-only", action="store_true")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--tier1-wd", type=float, default=0.0,
+                    help="tier1 pair 가중치 전용 weight decay. 프로브 ridge 의 lambda=10000 에 대응하는 "
+                         "정규화 -- 144명으로 33,210 개를 맞추므로 없으면 과적합한다")
+    ap.add_argument("--tier1-lr", type=float, default=None)
+    ap.add_argument("--tier1-pair", action="store_true",
+                    help="tier1 을 pair 인덱스 가중치로 준다 (3321x9, 프로브 ridge 와 동형). "
+                         "공유 가중치 배선(E5)은 resid_r 0.0354 로 프로브 0.1305 에 한참 못 미쳤다")
     ap.add_argument("--tier1", action="store_true",
                     help="티어 1 해부량(자로 잰 값)을 count head 에 넣는다. "
                          "프로브 실측 r=0.1305 로 학습된 feature 를 전부 이긴다")
@@ -288,6 +306,9 @@ def main():
                     help="count head 에 ROI 국소 anatomy 를 넣는다 (전략 문서 §3.2). "
                          "실측: 전역 a512 는 subject 성분 2.1%%, ROI 국소는 13.4%%")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="GPU lock 을 건너뛴다. **메모리 여유를 직접 확인한 뒤에만** 쓴다 "
+                         "(인코더 동결 arm 은 ~3GB 라 해동 arm 과 병렬 가능)")
     a = ap.parse_args()
 
     built = C.build(C.load(ROOT / a.config))
@@ -296,12 +317,19 @@ def main():
     for k, v in ARMS[a.arm].items():
         setattr(built["weights"], k, v)
     built["weights"].count = 0.0                    # 문서 §4.5: 절대 손실은 끈다
-    tag = a.arm + ("_local" if a.local else "") + ("_t1f" if a.tier1 else "")
+    tag = (a.arm + ("_local" if a.local else "") + ("_t1f" if a.tier1 else "")
+           + (f"p{a.tier1_wd:g}" if a.tier1_pair else ""))
+    assert not (a.tier1_pair and not a.tier1), "--tier1-pair 는 --tier1 과 같이 써야 한다"
     if a.tier1:
         from atm_sc.data.anat_tier1 import PAIR_DIM, STATS_PATH, pair_stats
         pair_stats(built["subjects"])                      # train 전용, 없으면 만든다
         built["cfg"].count_tier1_dim = PAIR_DIM
         built["cfg"].tier1_stats = str(STATS_PATH)
+        built["cfg"].count_tier1_pair = bool(a.tier1_pair)
+        built["cfg"].tier1_wd = float(a.tier1_wd)
+        built["cfg"].tier1_lr = a.tier1_lr
+        if a.tier1_pair:
+            print(f"[a2] tier1 pair 가중치 (ridge 동형): wd={a.tier1_wd} lr={a.tier1_lr}", flush=True)
         print(f"[a2] 티어 1 해부량 사용: tier1_dim={PAIR_DIM}", flush=True)
     if a.local:
         built["cfg"].count_local_dim = local_dim(built["t1_source"])
@@ -347,8 +375,15 @@ def main():
               f"diff_r={m['diff_corr']:+.4f} var={m['variance_ratio']:.3f} "
               f"inter={m['inter_subj_r_pred']:.5f} ({row['sec']:.0f}s)", flush=True)
 
-    if not acquire_lock(LOCK):
-        sys.exit(1)
+    locked = False
+    if not a.no_lock:
+        if not acquire_lock(LOCK):
+            sys.exit(1)
+        locked = True
+    else:
+        free = (torch.cuda.mem_get_info()[0] / 1e9) if torch.cuda.is_available() else 0.0
+        print(f"[a2] lock 우회 (--no-lock). GPU 여유 {free:.1f} GB", flush=True)
+        assert free > 4.0, f"GPU 여유가 {free:.1f} GB 뿐이다 -- 병렬 실행하면 둘 다 죽는다"
     try:
         ck = run(phase=built["phase"], subjects=built["subjects"], max_steps=built["max_steps"],
                  out_dir=built["out_dir"], cfg=built["cfg"], weights=built["weights"],
@@ -358,7 +393,8 @@ def main():
                  in_channels=built["in_channels"], template=built["template"],
                  t1_source=built["t1_source"], step_hook=hook, step_hook_every=a.eval_every)
     finally:
-        release_lock(LOCK)
+        if locked:
+            release_lock(LOCK)
 
     rows = [json.loads(l) for l in trace.read_text().splitlines() if l.strip()]
     best = max(rows, key=lambda r: r["resid_r"]) if rows else None

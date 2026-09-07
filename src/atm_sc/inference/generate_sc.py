@@ -15,20 +15,55 @@ from ..data.tt_io import hard_sc
 
 
 @torch.no_grad()
-def select_pairs(model, anatomy, n_roi: int, thr: float = 0.5, chunk: int = 8192):
-    """edge head 로 양성 pair 선택. (pairs [K,2], prob [K])"""
+def aux_feats_for(model, sub: str, source: str):
+    """edge_head / count_head_end 의 국소·티어1 입력 [3321, D] (전체 upper pair 순서). 없으면 (None, None).
+
+    inference 스크립트마다 따로 만들다가 하나(59번)가 빠져서 aux head 가 켜진 checkpoint 로는
+    죽었다. 여기 한 곳에서만 만든다.
+    """
+    h = model.edge_head
+    if h is None or not (int(getattr(h, "local_dim", 0) or 0) or int(getattr(h, "tier1_dim", 0) or 0)):
+        return None, None
+    n_roi = int(model.n_roi)
+    P = torch.as_tensor(np.stack(np.triu_indices(n_roi, 1), 1), device=model.device)
+    loc = t1f = None
+    if int(getattr(h, "local_dim", 0) or 0):
+        from ..data.local_feats import load_roi_feats, pair_local
+        loc = pair_local(load_roi_feats(sub, source, model.device, n_roi=n_roi), P)
+    if int(getattr(h, "tier1_dim", 0) or 0):
+        from ..data.anat_tier1 import STATS_PATH, pair_input
+        assert STATS_PATH.exists(), "scripts/55_anat_tier1.py 를 먼저 실행"
+        z = np.load(STATS_PATH, allow_pickle=False)
+        t1f = torch.as_tensor(pair_input(sub, {k: z[k] for k in z.files}, source), device=model.device)
+    return loc, t1f
+
+
+@torch.no_grad()   # 추론 전용. 호출측이 no_grad 를 안 걸면 .numpy() 에서 죽었다 (59번)
+def select_pairs(model, anatomy, n_roi: int, thr: float = 0.5, chunk: int = 8192,
+                 local=None, tier1=None):
+    """edge head 로 양성 pair 선택. (pairs [K,2], prob [K])
+
+    local/tier1 [3321, D] 는 edge head 가 그 통로로 만들어졌을 때 **전체 upper pair 순서**로 준다.
+    """
     iu = np.stack(np.triu_indices(n_roi, 1), 1)
     P = torch.as_tensor(iu, device=model.device)
-    probs = torch.cat([torch.sigmoid(model.edge_logits(anatomy, P[i:i + chunk])) for i in range(0, len(P), chunk)])
+    for nm, v in (("local", local), ("tier1", tier1)):
+        assert v is None or v.shape[0] == len(iu), f"{nm} 은 upper pair 전체({len(iu)}) 여야 한다: {v.shape}"
+    probs = torch.cat([torch.sigmoid(model.edge_logits(
+        anatomy, P[i:i + chunk],
+        None if local is None else local[i:i + chunk],
+        None if tier1 is None else tier1[i:i + chunk])) for i in range(0, len(P), chunk)])
     keep = probs > thr
     return iu[keep.cpu().numpy()], probs[keep].cpu().numpy()
 
 
 @torch.no_grad()
-def generate_tractogram(model, anatomy, pairs: np.ndarray, n_per_pair: int, chunk: int = 8192, seed: int = 0):
+def generate_tractogram(model, anatomy, pairs: np.ndarray, n_per_pair: int, chunk: int = 8192,
+                        seed: int = 0, local_roi=None):
     """-> (streamlines [N,128,3] mm float32, weights [N], pairs_rep [N,2])"""
     g = torch.Generator(device=model.device); g.manual_seed(seed)
-    S, w, pr = model.generate(anatomy, torch.as_tensor(pairs, device=model.device), n_per_pair, chunk=chunk, generator=g)
+    S, w, pr = model.generate(anatomy, torch.as_tensor(pairs, device=model.device), n_per_pair,
+                              chunk=chunk, generator=g, local_roi=local_roi)
     return S.cpu().numpy().astype(np.float32), w.cpu().numpy(), pr.cpu().numpy()
 
 
@@ -80,8 +115,27 @@ def save_trk(S: np.ndarray, path, ref_affine=None):
     nib.streamlines.save(t, str(path), header=hdr)
 
 @torch.no_grad()
+def pair_residual_log(model, anatomy, pairs: np.ndarray, template_log1p: np.ndarray,
+                      local=None, tier1=None) -> np.ndarray:
+    """pair count head 의 **subject 편차**를 log1p 공간에서 [K].
+
+    softplus(edge_log_counts) 가 head 의 log1p 예측이다 (softplus(log t) = log1p(t)).
+    template_log1p [R,R] 는 train split 전용 log1p 템플릿 (data/sc_template.py 의 mu).
+    잔차 학습(a1_resid)이 최적화한 바로 그 양이라, 여기서만 개인차가 정직하게 나온다.
+    """
+    P = torch.as_tensor(np.asarray(pairs, np.int64), device=model.device)
+    with torch.no_grad():
+        lp = torch.nn.functional.softplus(model.edge_log_counts(anatomy, P, local, tier1))
+    lp = lp.double().cpu().numpy()
+    assert np.isfinite(lp).all(), "pair count head 예측에 NaN/Inf"
+    mu = np.asarray(template_log1p, np.float64)[np.asarray(pairs)[:, 0], np.asarray(pairs)[:, 1]]
+    return lp - mu
+
+
 def allocate_counts(model, anatomy, pairs: np.ndarray, total: int | None = None,
-                    min_per_pair: int = 1, max_per_pair: int = 20000) -> np.ndarray:
+                    min_per_pair: int = 1, max_per_pair: int = 20000,
+                    resid_log: np.ndarray | None = None, resid_gain: float = 1.0,
+                    local=None, tier1=None) -> np.ndarray:
     """pair 마다 몇 가닥을 만들지 예측한다 (끝점 기준 count head).
 
     GT 는 100만 가닥 중 49 %가 두 ROI 를 끝점으로 갖고 pair 당 1~10,150 개로 천차만별이다.
@@ -89,8 +143,19 @@ def allocate_counts(model, anatomy, pairs: np.ndarray, total: int | None = None,
     total 을 주면 예측 비율을 유지한 채 총합을 그 값으로 맞춘다.
     """
     P = torch.as_tensor(np.asarray(pairs, np.int64), device=model.device)
-    n = model.edge_log_counts_end(anatomy, P).exp().cpu().numpy()
+    with torch.no_grad():
+        n = model.edge_log_counts_end(anatomy, P, local, tier1).exp()
+    n = n.cpu().numpy()
     assert np.isfinite(n).all() and (n >= 0).all()
+    if resid_log is not None:
+        # 끝점 head 는 잔차 목적으로 학습된 적이 없어 그 subject 성분은 사실상 잡음이다
+        # (실측 r 0.57, 균등 배분 0.71 보다도 낮다). 개인차는 잔차 목적으로 학습된 pair head 가
+        # 갖고 있으므로, 끝점 head 의 **집단 수준 크기**에 pair head 의 **subject 편차**를 곱한다.
+        # resid_log 는 log1p 공간의 편차이고 count 비율의 로그와 같다 (count >> 1 구간).
+        r = np.asarray(resid_log, np.float64)
+        assert r.shape == n.shape, (r.shape, n.shape)
+        assert np.isfinite(r).all(), "resid_log 에 NaN/Inf"
+        n = n * np.exp(np.clip(float(resid_gain) * r, -5.0, 5.0))   # min/max_per_pair 가 최종 상한이다
     if total is not None:
         n = n * (float(total) / max(n.sum(), 1e-9))
     n = np.clip(np.round(n), min_per_pair, max_per_pair).astype(np.int64)

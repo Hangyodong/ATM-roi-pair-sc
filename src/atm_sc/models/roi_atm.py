@@ -87,6 +87,10 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
     kw.setdefault("count_local_dim", int(sd.get("count_local_dim", 0)))
     kw.setdefault("cond_local_dim", int(sd.get("cond_local_dim", 0)))
     kw.setdefault("count_tier1_dim", int(sd.get("count_tier1_dim", 0)))
+    kw.setdefault("count_tier1_pair", bool(sd.get("count_tier1_pair", False)))
+    kw.setdefault("aux_local_dim", int(sd.get("aux_local_dim", 0)))
+    kw.setdefault("aux_tier1_dim", int(sd.get("aux_tier1_dim", 0)))
+    kw.setdefault("prior_local_rank", int(sd.get("prior_local_rank", 0)))
     kw.setdefault("prior_local_dim", int(sd.get("prior_local_dim", 0)))
     if sd.get("pair_anchor"):
         kw.setdefault("pair_anchor", sd["pair_anchor"])
@@ -110,7 +114,9 @@ class ROIPairATM(nn.Module):
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
                  count_local_dim: int = 0, cond_local_dim: int = 0,
                  pair_anchor: str | bool | None = None, anchor_alpha: float = 0.0,
-                 count_tier1_dim: int = 0, prior_local_dim: int = 0):
+                 count_tier1_dim: int = 0, count_tier1_pair: bool = False,
+                 aux_local_dim: int = 0, aux_tier1_dim: int = 0,
+                 prior_local_dim: int = 0, prior_local_rank: int = 0):
         """trainable: 'decoder' | 'vae' | 'vae+unet4' | 'full'.
         unet_level: 'none' | 'stage4' | 'stage3' | 'stage2' | 'full'. 주면 trainable 의 UNet 부분을 덮어쓴다.
         'full' = VAE 인코더/디코더 + UNet 전체 + heads (최종 전략 §2).
@@ -138,7 +144,9 @@ class ROIPairATM(nn.Module):
         self.pair_emb = ROIPairEmbedding(n_roi, emb_dim, ANATOMICAL_DIM, latent_dim=LATENT_DIM,
                                          prior_use_anatomy=prior_use_anatomy,
                                          local_dim=int(cond_local_dim),
-                                         prior_local_dim=int(prior_local_dim)).to(self.device)
+                                         prior_local_dim=int(prior_local_dim),
+                                       prior_local_rank=int(prior_local_rank),
+                                       prior_local_n_roi=(n_roi if prior_local_rank else 0)).to(self.device)
         # pair 앵커 재매개화 (models/pair_anchor.py). 전역 박스가 실제 pair 범위의 28배 부피라
         # z/prior 가 "뇌 어디쯤"까지 떠안고 있다. alpha=0 이면 기존 동작과 bit-exact 다.
         self.anchor = None
@@ -155,8 +163,13 @@ class ROIPairATM(nn.Module):
             for k, v in tpl.items():
                 assert v.shape == (n_roi, n_roi), f"{k} 템플릿 {v.shape} != ({n_roi},{n_roi})"
         self.template = tpl
+        # aux_* 는 edge_head 와 count_head_end 에 국소/티어1 통로를 연다. 이 둘은 추론에서
+        # "어떤 pair 를 만들지"(edge_head)와 "몇 가닥 만들지"(count_head_end)를 정하는데, 전역
+        # a512 만 받으면 subject 별로 거의 같은 답을 낸다 (실측 edge Jaccard 0.9896).
         self.edge_head = EdgeHead(ANATOMICAL_DIM, emb_dim,
-                                  template_prob=None if tpl is None else tpl["edge_prob"]
+                                  template_prob=None if tpl is None else tpl["edge_prob"],
+                                  local_dim=int(aux_local_dim), tier1_dim=int(aux_tier1_dim),
+                                  tier1_n_roi=(self.n_roi if (aux_tier1_dim and count_tier1_pair) else 0)
                                   ).to(self.device) if use_edge_head else None
         # SC edge 값을 직접 예측 (EDGE_ALIGNED 전략 §19-22). weight head 는 streamline 별 가중치라
         # 총합 정규화된 magnitude loss 로는 절대 스케일을 못 배운다 (실측 CCC 0.02).
@@ -164,12 +177,15 @@ class ROIPairATM(nn.Module):
         self.count_head = EdgeCountHead(ANATOMICAL_DIM, emb_dim,
                                         template=None if tpl is None else tpl["sc_pass"],
                                         local_dim=int(count_local_dim),
-                                        tier1_dim=int(count_tier1_dim)
+                                        tier1_dim=int(count_tier1_dim),
+                                        tier1_n_roi=(self.n_roi if count_tier1_pair else 0)
                                         ).to(self.device) if use_edge_head else None
         # pass 기준(SC 값)과 별도로 **끝점 기준** 개수를 예측한다. 추론에서 pair 마다 몇 가닥을 만들지 정하는 값.
         # GT: 100만 가닥 중 49 %가 두 ROI 를 끝점으로 갖고, pair 당 1~10,150 개로 천차만별이다.
         self.count_head_end = EdgeCountHead(ANATOMICAL_DIM, emb_dim, init_log_count=3.0,
-                                            template=None if tpl is None else tpl["sc_end"]
+                                            template=None if tpl is None else tpl["sc_end"],
+                                            local_dim=int(aux_local_dim), tier1_dim=int(aux_tier1_dim),
+                                            tier1_n_roi=(self.n_roi if (aux_tier1_dim and count_tier1_pair) else 0)
                                             ).to(self.device) if use_edge_head else None
         # 디코더 정련망 (PIPELINE_11 §D1). 좌표 상수는 디코더와 **같은 것**을 쓴다 -- 다르면
         # 정규화/역정규화가 어긋나 조용히 틀린다.
@@ -246,16 +262,30 @@ class ROIPairATM(nn.Module):
         prior_scale = [self.pair_emb.prior_log_sigma.weight, self.pair_emb.prior_log_sigma.bias,
                        self.pair_emb.mode_log_sigma.weight]
         ps_ids = {id(p) for p in prior_scale}
+        # tier1 pair 가중치는 33,210 개를 144명으로 맞춘다. 프로브 ridge 가 lambda=10000 이라는
+        # 강한 L2 아래에서 r=0.1305 를 낸 값이라, 정규화 없이 그대로 두면 재현이 안 된다.
+        # 별도 그룹으로 빼서 weight decay 를 따로 건다 (AdamW 의 decoupled decay).
+        tier1_pair = [p for h in (self.count_head, self.count_head_end, self.edge_head)
+                      if h is not None and getattr(h, "tier1_w", None) is not None
+                      for p in (h.tier1_w, h.tier1_b)]
+        # prior 의 pair 별 저랭크 가중치도 같은 weight decay 를 받아야 한다 (1.7M / 144명).
+        if getattr(self.pair_emb, "prior_local_w", None) is not None:
+            tier1_pair.append(self.pair_emb.prior_local_w)
+        ps_ids |= {id(p) for p in tier1_pair}
         groups = {"t1_encoder": list(self.atm.unet_trainable_parameters()),
                   "vae_encoder": [] if self.trainable == "decoder"
                   else [p for p in self.atm.net.ae.parameters() if id(p) not in dec_ids],
                   "decoder": dec,
                   "prior_scale": prior_scale,
+                  "tier1_pair": tier1_pair,
                   "heads": [p for p in self.pair_emb.parameters() if id(p) not in ps_ids]
                   + (list(self.weight_head.parameters()) if self.weight_head is not None else [])
-                  + (list(self.edge_head.parameters()) if self.edge_head is not None else [])
-                  + (list(self.count_head.parameters()) if self.count_head is not None else [])
-                  + (list(self.count_head_end.parameters()) if self.count_head_end is not None else [])}
+                  + ([p for p in self.edge_head.parameters() if id(p) not in ps_ids]
+                     if self.edge_head is not None else [])
+                  + ([p for p in self.count_head.parameters() if id(p) not in ps_ids]
+                     if self.count_head is not None else [])
+                  + ([p for p in self.count_head_end.parameters() if id(p) not in ps_ids]
+                     if self.count_head_end is not None else [])}
         return groups
 
     def trainable_parameters(self):
@@ -347,10 +377,12 @@ class ROIPairATM(nn.Module):
             return torch.ones(z.shape[0], device=z.device)
         return self.weight_head(cond, z)
 
-    def edge_logits(self, anatomy: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+    def edge_logits(self, anatomy: torch.Tensor, pairs: torch.Tensor,
+                    local: torch.Tensor | None = None,
+                    tier1: torch.Tensor | None = None) -> torch.Tensor:
         assert self.edge_head is not None, "edge head 비활성"
         cp = canonical_pairs(pairs)
-        return self.edge_head(anatomy, self.pair_emb.pair_vec(cp), cp)
+        return self.edge_head(anatomy, self.pair_emb.pair_vec(cp), cp, local, tier1)
 
     def edge_log_counts(self, anatomy: torch.Tensor, pairs: torch.Tensor,
                         local: torch.Tensor | None = None,
@@ -361,17 +393,25 @@ class ROIPairATM(nn.Module):
         cp = canonical_pairs(pairs)
         return self.count_head(anatomy, self.pair_emb.pair_vec(cp), cp, local, tier1)
 
-    def edge_log_counts_end(self, anatomy: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+    def edge_log_counts_end(self, anatomy: torch.Tensor, pairs: torch.Tensor,
+                            local: torch.Tensor | None = None,
+                            tier1: torch.Tensor | None = None) -> torch.Tensor:
         """[K,2] -> 끝점 기준 log count [K]. exp 하면 그 pair 를 끝점으로 갖는 가닥 수."""
         assert self.count_head_end is not None, "count head 비활성"
         cp = canonical_pairs(pairs)
-        return self.count_head_end(anatomy, self.pair_emb.pair_vec(cp), cp)
+        return self.count_head_end(anatomy, self.pair_emb.pair_vec(cp), cp, local, tier1)
 
-    def edge_count_matrix(self, anatomy: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
-        """[K,2] -> 대칭 [n_roi,n_roi] 예측 count 행렬 (대각 0)."""
+    def edge_count_matrix(self, anatomy: torch.Tensor, pairs: torch.Tensor,
+                          local: torch.Tensor | None = None,
+                          tier1: torch.Tensor | None = None) -> torch.Tensor:
+        """[K,2] -> 대칭 [n_roi,n_roi] 예측 count 행렬 (대각 0).
+
+        local/tier1 은 count head 가 그 통로로 만들어졌으면 **반드시** 줘야 한다 (안 주면 head 의
+        assert 가 잡는다). 예전에는 여기서 안 넘겨서 국소 통로를 켜면 추론이 죽었다."""
         assert self.count_head is not None, "count head 비활성"
         cp = canonical_pairs(pairs)
-        return self.count_head.matrix(anatomy, self.pair_emb.pair_vec(cp), cp, self.n_roi)
+        return self.count_head.matrix(anatomy, self.pair_emb.pair_vec(cp), cp, self.n_roi,
+                                      local, tier1)
 
     def prior_mean(self, pairs: torch.Tensor, mode=0) -> torch.Tensor:
         return self.pair_emb.prior_mean(canonical_pairs(pairs), mode)

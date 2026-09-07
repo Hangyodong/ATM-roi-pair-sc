@@ -28,7 +28,8 @@ def canonical_pairs(pairs: torch.Tensor) -> torch.Tensor:
 class ROIPairEmbedding(nn.Module):
     def __init__(self, n_roi: int, emb_dim: int = 64, cond_dim: int = 512, hidden: int = 256,
                  latent_dim: int = 64, n_modes: int = 2, prior_use_anatomy: bool = False,
-                 local_dim: int = 0, prior_local_dim: int = 0):
+                 local_dim: int = 0, prior_local_dim: int = 0,
+                 prior_local_rank: int = 0, prior_local_n_roi: int = 0):
         super().__init__()
         self.n_roi, self.emb_dim, self.cond_dim = n_roi, emb_dim, cond_dim
         self.emb = nn.Embedding(n_roi, emb_dim)
@@ -101,6 +102,20 @@ class ROIPairEmbedding(nn.Module):
                 nn.Linear(self.prior_local_dim + emb_dim, hidden), nn.GELU(),
                 nn.Linear(hidden, 2 * latent_dim))
             nn.init.zeros_(self.prior_local[-1].weight); nn.init.zeros_(self.prior_local[-1].bias)
+        # pair 인덱스 저랭크 가지. 왜 -- 위의 공유 MLP 는 실측(D-f 2000 step) 으로 실패했다:
+        # posterior mu 의 subject 성분이 **0.566** 인데 prior mu 는 **0.000154** 만 가져왔다.
+        # 배울 신호가 56.6% 있는데 0.015% 만 배운 것이다. count_head 의 tier1 에서 겪은 것과 같은
+        # 실패다 -- 공유 가중치는 pair 마다 다른 방향의 신호를 표현하지 못한다.
+        # 전체 pair 별 [512 -> 128] 은 3321*512*128 = 2.2억 개라 못 쓴다. 공유 압축 U(512->rank)
+        # 뒤에 pair 별 [rank -> 2*latent] 를 둔다: rank 4 면 3321*4*128 = 1.7M.
+        # bias 는 두지 않는다 -- pair 별 상수는 prior_mu 가 이미 갖고 있어 중복이다.
+        self.prior_local_rank, self.prior_local_n_roi = int(prior_local_rank), int(prior_local_n_roi)
+        self.prior_local_u = self.prior_local_w = None
+        if self.prior_local_dim and self.prior_local_rank and self.prior_local_n_roi:
+            n_pair = self.prior_local_n_roi * (self.prior_local_n_roi - 1) // 2
+            self.prior_local_u = nn.Linear(self.prior_local_dim, self.prior_local_rank, bias=False)
+            self.prior_local_w = nn.Parameter(
+                torch.zeros(n_pair, self.prior_local_rank, 2 * latent_dim))   # 0-init -> bit-exact 시작
         self.prior_use_anatomy = bool(prior_use_anatomy)
         self.prior_anatomy = nn.Linear(cond_dim, 2 * latent_dim)
         nn.init.zeros_(self.prior_anatomy.weight); nn.init.zeros_(self.prior_anatomy.bias)
@@ -147,6 +162,11 @@ class ROIPairEmbedding(nn.Module):
             assert local.shape == (pairs.shape[0], self.prior_local_dim), (
                 local.shape, pairs.shape[0], self.prior_local_dim)
             dl = self.prior_local(torch.cat([local, v], dim=-1))
+            if self.prior_local_w is not None:
+                from .pair_anchor import upper_index
+                idx = upper_index(pairs[:, 0].long(), pairs[:, 1].long(), self.prior_local_n_roi)
+                u = self.prior_local_u(local)                       # [K, rank]
+                dl = dl + torch.einsum("kr,krd->kd", u, self.prior_local_w[idx])
             mu = mu + dl[:, :self.latent_dim]
             ls = ls + dl[:, self.latent_dim:]
         else:
@@ -159,9 +179,18 @@ class ROIPairEmbedding(nn.Module):
         m = self._mode_idx(mode, pairs.shape[0], pairs.device)
         return self.prior_mu(self.pair_vec(pairs)) + self.mode_prior(m)
 
-    def prior_log_std(self, pairs: torch.Tensor, mode=0, anatomy=None) -> torch.Tensor:
-        """[N,2] -> log_sigma [N, latent_dim]. 0-init 상태에서는 전부 0 (sigma=1)."""
-        return self.prior_params(pairs, mode, anatomy)[1]
+    def prior_log_std(self, pairs: torch.Tensor, mode=0, anatomy=None,
+                      local: torch.Tensor | None = None) -> torch.Tensor:
+        """[N,2] -> log_sigma [N, latent_dim]. 0-init 상태에서는 전부 0 (sigma=1).
+
+        **진단용**이다. local 을 안 주면 국소 입력을 0 으로 넣는다 -- 국소 가지가 **없는** 것과
+        같지 않다 (학습된 공유 MLP 는 0 입력에도 0 이 아닌 값을 낸다). 실제 추론 경로는
+        sample_prior/prior_params 를 쓰고 거기서는 local 이 필수다.
+        """
+        if local is None and self.prior_local is not None:
+            local = torch.zeros(pairs.shape[0], self.prior_local_dim,
+                                device=pairs.device, dtype=self.prior_mu.weight.dtype)
+        return self.prior_params(pairs, mode, anatomy, local)[1]
 
     def sample_prior(self, pairs: torch.Tensor, mode=0, anatomy=None,
                      generator: torch.Generator | None = None,

@@ -107,7 +107,7 @@ def bn_recalibrate(m, refiner, data, batch=2048) -> int:
     for b in bns:
         b.reset_running_stats(); b.momentum = None
     m.train()
-    for S, P, feat in data:
+    for S, P, feat, _sub in data:   # 배치 튜플에 subject 가 추가됐다 (국소 feature 용)
         for i in range(0, len(S), batch):
             s, p = S[i:i + batch].to(m.device), P[i:i + batch].to(m.device)
             c = m.condition(feat, p)
@@ -149,7 +149,7 @@ def load_subject(sub, n_per_pair, rng, device):
 def _rmse(m, refiner, data, batch=2048, flip=False):
     """held-out 복원 RMSE (mm). 모드(train/eval)는 호출측이 정한다."""
     tot, n = 0.0, 0
-    for S, P, feat in data:
+    for S, P, feat, _sub in data:   # 배치 튜플에 subject 가 추가됐다 (국소 feature 용)
         for i in range(0, len(S), batch):
             s, p = S[i:i + batch].to(m.device), P[i:i + batch].to(m.device)
             c = m.condition(feat, p)

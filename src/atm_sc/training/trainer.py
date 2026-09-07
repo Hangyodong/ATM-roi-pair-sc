@@ -51,6 +51,8 @@ class LossWeights:
     seg_geom: float = 1.0
     seg_endpoint: float = 0.5
     count: float = 1.0
+    count_end: float = 0.0    # 끝점 count head 전용. w.count 와 나눈다 --
+                              # 잔차 실험은 w.count=0 이지만 배분 head 는 학습해야 한다
     scale: float = 1.0            # 총합 로그 차이 (전역 배율). 실측: 배율 하나로 CCC 0.024 -> 0.817
     rmse: float = 0.2             # GT 표준편차로 무차원화한 SC RMSE (절대 오차)
     edge: float = 0.5
@@ -72,6 +74,13 @@ class LossWeights:
     #     precision_ratio 36.61 -> 15.60 (arch_additive). K-혼합은 14.40 로 거의 안 붙어서 쓰지 않는다.
     prior: float = 0.0
     seg_prior: float = 0.0
+    # D-f'' : prior 의 **subject 잔차** 적합항. 실측 -- posterior mu 의 subject 잔차는 split-half
+    # r=0.9956 으로 재현되는 진짜 신호인데(다른 subject 는 -0.14), 위 L_prior 하나로는 pair 별
+    # 저랭크 가지를 붙여도 0.09% 만 배웠다. pair 평균이 손실을 압도해 subject 잔차 기울기가
+    # 묻히고 sigma_p 가 잔차를 흡수한다. count_head 에서 템플릿을 빼고 잔차만 맞춰 살린 것과
+    # 같은 처방: r_q = mu_q - EMA_pair[mu_q],  r_p = mu_p - prior_mean(pair)  (= 국소 가지 기여)
+    prior_res: float = 0.0
+    prior_res_corr: float = 0.0
 
 
 @dataclass
@@ -114,7 +123,13 @@ class TrainConfig:
     count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
     cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
     count_tier1_dim: int = 0              # >0 이면 count head 가 티어 1 해부량(자로 잰 값)을 받는다
+    count_tier1_pair: bool = False   # tier1 을 pair 인덱스 가중치로 (ridge 동형)
+    aux_local_dim: int = 0            # edge_head / count_head_end 국소 통로
+    aux_tier1_dim: int = 0            # edge_head / count_head_end 티어1 통로
+    tier1_lr: float | None = None     # tier1 pair 가중치 전용 LR (None = lr_heads)
+    tier1_wd: float = 0.0             # tier1 pair 가중치 전용 weight decay (ridge lambda 대응)
     prior_local_dim: int = 0              # D-f: >0 이면 prior 가 **pair 의존** 국소 anatomy 를 받는다
+    prior_local_rank: int = 0     # >0 이면 prior 국소 가지를 pair 인덱스 저랭크로
     tier1_stats: str | None = None        # train 전용 표준화 통계 npz (data/anat_tier1.pair_stats)
     pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
     anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
@@ -162,10 +177,13 @@ class Trainer:
         g = model.param_groups()
         lrs = {"t1_encoder": cfg.lr_t1, "vae_encoder": cfg.lr_vae_enc, "decoder": cfg.lr_dec,
                "heads": cfg.lr_heads,
-               "prior_scale": cfg.lr_heads if cfg.lr_prior is None else cfg.lr_prior}
+               "prior_scale": cfg.lr_heads if cfg.lr_prior is None else cfg.lr_prior,
+               "tier1_pair": cfg.lr_heads if cfg.tier1_lr is None else cfg.tier1_lr}
         if cfg.lr is not None:
             lrs.update(t1_encoder=cfg.lr, vae_encoder=cfg.lr, decoder=cfg.lr)
-        self.groups = [{"params": ps, "lr": lrs[k], "name": k} for k, ps in g.items() if ps]
+        self.groups = [{"params": ps, "lr": lrs[k], "name": k,
+                        "weight_decay": (cfg.tier1_wd if k == "tier1_pair" else 0.0)}
+                       for k, ps in g.items() if ps]
         self.opt = torch.optim.AdamW(self.groups, weight_decay=0.0)
         self.device = model.device
         self.rng = np.random.default_rng(cfg.seed)
@@ -186,15 +204,32 @@ class Trainer:
         self._roi_labels = None              # stage3 격자의 아틀라스 (살아있는 풀링용)
         self._tier1 = {}                     # subject -> [K, 9] (표준화된 티어 1 pair feature)
         self._tier1_stats = None
-        if cfg.count_tier1_dim:
-            assert cfg.tier1_stats, 'count_tier1_dim > 0 이면 tier1_stats 경로가 필요하다'
+        if cfg.count_tier1_dim or cfg.aux_tier1_dim:
+            assert cfg.tier1_stats, 'tier1 통로를 켰으면 tier1_stats 경로가 필요하다'
             import numpy as _np
             z = _np.load(cfg.tier1_stats, allow_pickle=False)
             self._tier1_stats = {k: z[k] for k in z.files}
-            assert model.count_head.tier1_dim == cfg.count_tier1_dim, (
+            if cfg.aux_tier1_dim:
+                assert model.edge_head is not None and model.edge_head.tier1_dim == cfg.aux_tier1_dim, (
+                    'edge head 의 tier1_dim 이 config 와 다르다')
+                assert model.count_head_end.tier1_dim == cfg.aux_tier1_dim, (
+                    'count_head_end 의 tier1_dim 이 config 와 다르다')
+            assert not cfg.count_tier1_dim or model.count_head.tier1_dim == cfg.count_tier1_dim, (
                 'count head 의 tier1_dim 이 config 와 다르다',
                 model.count_head.tier1_dim, cfg.count_tier1_dim)
         self._o3_leaf = self._roi_cache = None
+        # prior 잔차 적합용 pair 별 posterior mu EMA. train 중 본 subject 들의 평균 -> 이걸 빼야
+        # 남는 것이 subject 잔차다. 시작값은 prior_mean(pair) 라 초기 잔차가 0 이다 (편향 없음).
+        self._mu_bar = None
+        if self.w.prior_res > 0 or self.w.prior_res_corr > 0:
+            n_roi_ = int(model.n_roi); iu_ = np.stack(np.triu_indices(n_roi_, 1), 1)
+            with torch.no_grad():
+                self._mu_bar = model.prior_mean(torch.as_tensor(iu_, device=self.device)).detach().clone()
+            assert self._mu_bar.shape == (len(iu_), model.pair_emb.latent_dim), self._mu_bar.shape
+            assert model.pair_emb.prior_local is not None, \
+                "prior_res 손실은 prior 국소 가지(prior_local_dim > 0)가 있어야 의미가 있다"
+            print(f"[trainer] prior 잔차 적합: EMA {tuple(self._mu_bar.shape)} momentum={cfg.resid_momentum} "
+                  f"warmup={cfg.resid_warmup}", flush=True)
         # 실측(A10, stage3): checkpoint 를 끄면 0.97 -> 0.55 s/step 이고 VRAM 은 9.3GB 로 같다.
         # 원래 메모리를 아끼는 기법인데 여기선 안 아껴서 순수 낭비다.
         model.atm.use_checkpoint = bool(cfg.use_checkpoint)
@@ -292,16 +327,48 @@ class Trainer:
         self._roi_cache = roi_pool(o3, self._roi_labels, self.model.n_roi)
         return self._roi_cache
 
-    def tier1_feat(self, sub: str) -> torch.Tensor | None:
-        """[K, 9] 표준화된 티어 1 pair feature. 학습이 아니라 **계산된 값**이라 캐시해도 안전하다
-        (인코더가 학습돼도 안 변한다 -- 그게 국소 feature 와 다른 점이다)."""
-        if not self.cfg.count_tier1_dim:
+    def aux_local(self, sub: str, pairs: torch.Tensor) -> torch.Tensor | None:
+        """edge_head / count_head_end 용 [K, aux_local_dim]. 본체는 cond_local 과 같다."""
+        if not self.cfg.aux_local_dim:
             return None
+        live = self._roi_from_live()
+        if live is not None:
+            return L_local.pair_local(live, pairs)
+        from ..data.local_feats import load_roi_feats
+        if sub not in self._local:
+            self._local[sub] = load_roi_feats(sub, self.cfg.local_source, self.device,
+                                              n_roi=self.model.n_roi)
+        return L_local.pair_local(self._local[sub], pairs)
+
+    def tier1_pairs(self, sub: str, pairs: torch.Tensor) -> torch.Tensor | None:
+        """임의의 pair 부분집합 [K,2] 에 대한 티어1 feature [K,9].
+
+        tier1_feat 은 3321 개 upper pair **전체** 순서로 캐시돼 있다. edge 손실은 그중 일부만
+        뽑아 쓰므로 여기서 upper_index 로 골라야 한다 -- 순서를 안 맞추면 조용히 다른 pair 의
+        해부량을 먹인다."""
+        if not (self.cfg.aux_tier1_dim or self.cfg.count_tier1_dim):
+            return None
+        allf = self._tier1_all(sub)
+        from ..models.pair_anchor import upper_index
+        lo = torch.minimum(pairs[:, 0], pairs[:, 1]).long()
+        hi = torch.maximum(pairs[:, 0], pairs[:, 1]).long()
+        idx = upper_index(lo, hi, self.model.n_roi)
+        assert int(idx.min()) >= 0 and int(idx.max()) < allf.shape[0], (int(idx.min()), int(idx.max()))
+        return allf[idx]
+
+    def _tier1_all(self, sub: str) -> torch.Tensor:
         if sub not in self._tier1:
             from ..data.anat_tier1 import pair_input
             self._tier1[sub] = torch.as_tensor(
                 pair_input(sub, self._tier1_stats, self.cfg.local_source), device=self.device)
         return self._tier1[sub]
+
+    def tier1_feat(self, sub: str) -> torch.Tensor | None:
+        """[3321, 9] 표준화된 티어 1 pair feature. 학습이 아니라 **계산된 값**이라 캐시해도 안전하다
+        (인코더가 학습돼도 안 변한다 -- 그게 국소 feature 와 다른 점이다)."""
+        if not self.cfg.count_tier1_dim:
+            return None
+        return self._tier1_all(sub)
 
     def local_feat(self, sub: str) -> torch.Tensor | None:
         """subject 의 ROI 국소 anatomy [R, D]. count_local_dim = 0 이면 None."""
@@ -549,6 +616,33 @@ class Trainer:
                 # posterior 평균이 prior 평균에서 얼마나 떨어져 있나 (잠재 단위). w2a_latent_drift
                 # 의 5.27 -> 3.51 과 같은 양이다.
                 out["prior_offset"] = float((mu.detach() - mu_p.detach()).norm(dim=1).mean())
+            if self._mu_bar is not None:
+                from ..models.pair_anchor import upper_index
+                from ..models.roi_pair_embedding import canonical_pairs as _cp
+                cpg = _cp(P_gt)
+                idx = upper_index(cpg[:, 0].long(), cpg[:, 1].long(), int(m.n_roi))
+                r_p = mu_p - m.prior_mean(P_gt)                     # 국소 가지 기여
+                r_q = (mu.detach() - self._mu_bar[idx]).detach()    # posterior 의 subject 잔차
+                warm = step is not None and step < cfg.resid_warmup
+                out["prior_res_r"] = float(L.pearson(r_p.detach().flatten(), r_q.flatten()))
+                out["prior_res_gt_norm"] = float(r_q.norm(dim=1).mean())
+                if not warm:
+                    if w.prior_res > 0:
+                        l_pr = L.residual_smooth_l1(r_p, r_q, beta=cfg.resid_beta)
+                        tot_r = tot_r + w.prior_res * l_pr
+                        out["L_prior_res"] = float(l_pr)
+                    if w.prior_res_corr > 0:
+                        l_prc = L.residual_corr_loss(r_p.flatten(), r_q.flatten())
+                        tot_r = tot_r + w.prior_res_corr * l_prc
+                        out["L_prior_res_corr"] = float(l_prc)
+                with torch.no_grad():                                # EMA 갱신 (pair 별 평균 먼저)
+                    n_pair = self._mu_bar.shape[0]
+                    acc = torch.zeros_like(self._mu_bar).index_add_(0, idx, mu.detach().float())
+                    cnt = torch.zeros(n_pair, device=self.device).index_add_(
+                        0, idx, torch.ones(len(idx), device=self.device))
+                    seen = cnt > 0
+                    self._mu_bar[seen] = ((1.0 - cfg.resid_momentum) * self._mu_bar[seen]
+                                          + cfg.resid_momentum * (acc[seen] / cnt[seen, None]))
             if rec_route and V_gt is not None:
                 keep = (V_gt.sum(-1) > 0)            # synthetic streamline 은 GT 통과 정보가 없다 -> 제외
                 if bool(keep.any()):
@@ -572,7 +666,9 @@ class Trainer:
             nn_ = subject.negative_pairs(cfg.neg_pairs_per_step, self.rng)
             P = torch.as_tensor(np.concatenate([pp, nn_]), device=self.device)
             y = torch.cat([torch.ones(len(pp)), torch.zeros(len(nn_))]).to(self.device)
-            logits = m.edge_logits(a_leaf, P)
+            el = self.aux_local(subject.sub, P) if m.edge_head.local_dim else None
+            et = self.tier1_pairs(subject.sub, P) if m.edge_head.tier1_dim else None
+            logits = m.edge_logits(a_leaf, P, el, et)
             l_edge = L.edge_loss(logits, y)
             (w.edge * l_edge).backward()
             out["L_edge"] = float(l_edge); out.update(L.edge_metrics(logits, y))
@@ -679,9 +775,11 @@ class Trainer:
                 out["L_resid"] = float(l_res)
             if m.count_head_end is not None:            # 추론에서 pair 별 생성 개수를 정하는 값
                 gt_e = torch.as_tensor(np.asarray(subject.sc_end, np.float32), device=self.device)[iu[0], iu[1]]
-                lce = m.edge_log_counts_end(a_leaf, P_all)
+                cl = self.aux_local(subject.sub, P_all) if m.count_head_end.local_dim else None
+                ct = self.tier1_pairs(subject.sub, P_all) if m.count_head_end.tier1_dim else None
+                lce = m.edge_log_counts_end(a_leaf, P_all, cl, ct)
                 l_ce = L.edge_count_loss(lce, gt_e, mk)
-                tot_c = tot_c + w.count * l_ce
+                tot_c = tot_c + max(w.count, w.count_end) * l_ce
                 out["L_count_end"] = float(l_ce)
                 out.update({f"cend_{k}": v for k, v in L.edge_count_metrics(lce.detach().exp(), gt_e).items()})
             tot_c.backward()

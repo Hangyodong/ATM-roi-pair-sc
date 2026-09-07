@@ -199,3 +199,55 @@
 | B3 | 후처리 필터 (GM/WM 마스크 + minlength 20) | overreach **1.407** vs GT 0.212 | 마스크는 있음 |
 | C | prior 를 `arch_additive` 구조로 | NLL 71.62 → 15.60 | 재학습 |
 | — | DWI/FOD 입력 추가, GT native space | 정보를 실제로 더하는 유일한 길 | **막힘** (raw DWI/DSI Studio 없음) |
+
+---
+
+## 9. 2026-09-07 — E/D 재설계 (M13~M22)
+
+전제가 바뀐 날이다. "feature 문제가 아니다"(사용자 지적)가 맞았고, 병목은 **풀링**과 **공유 가중치**였다.
+전부 val 31명에서 판정했고 test 는 안 썼다 ([[test-split-used-once]]).
+
+### M13. count head 에 ROI 국소 feature 통로 (`edge_count_head.py` local_proj)
+- 왜: `a512` 의 subject 성분 2.1% (코사인 0.9994) vs ROI 국소 풀링 13.4%. global average pooling 이 개인차를 지운 뒤였다.
+- 결과: `resid_r` +0.001 → **+0.034**, self−shuffled −0.005 → +0.031, 식별 0.032 → 0.065.
+
+### M14. 티어 1 해부량 (`data/anat_tier1.py`, 9-d pair feature)
+- 왜: 프로브 ridge 가 GT SC 잔차와 **r=0.1305** (206명, 순열 p=0.0, 귀무 sd 0.0132). 학습된 feature 전부를 이긴다.
+- 함정: 원본 T1 밝기 중앙값이 163~63,824 (390배) — 스캐너 스케일. 중앙값 정규화하고 `t1_scale` 은 교란변수로만 남김.
+- 공유 MLP 로 붙인 E5: `resid_r` 0.0354, shuffled +0.0158 — **프로브의 1/4, 실패**.
+
+### M15. 티어 1 을 pair 인덱스 가중치로 (`tier1_w [3321,9]`, ridge 와 동형)
+- 왜: 프로브가 이긴 자유도는 pair 마다 독립인 29,889 개였다. 공유 가중치는 그걸 통째로 버린다.
+- 결과 (E6): `resid_r` 0.0354 → **0.0739**, self−shuffled +0.0692, 식별 **0.194 (p=0.00, 12회 전부 유의)**, `inter_subj` 0.9996 → 0.9879. wd 0.1 이 1.0 보다 낫다 (E7).
+
+### M16. 인코더 stage3 해동 + M15 (E8)
+- 결과: gap **0.0704 @2500**, 식별 **0.258 (8× chance)**. `unet_level=full` 은 t1_encoder 23.7M 으로 stage3(22.4M) 대비 +5.9% 뿐이고 20.8GB 로 OOM → 드롭.
+- 함정: 마지막 checkpoint 만 남아 `max_steps` 가 곧 모델 선택이다. E8 은 최적(2500)이 아닌 3000 을 쓴다.
+
+### M17. 추론 배분을 pair count head 잔차로 변조 (`allocate_counts(resid_log=...)`)
+- 왜: `allocate_counts` 가 읽던 `count_head_end` 는 잔차 목적으로 학습된 적이 없다. E 축이 만든 개인차를 생성 경로가 아예 안 읽었다.
+- 부수 버그 3개: `edge_count_matrix` 가 local/tier1 을 안 넘겨 **국소 통로 checkpoint 로는 추론이 죽던 것**, pair dtype, grad 누수.
+- 결과 (val 12명, alloc 경로): gain 1 → `inter_subj` 0.9950 / `resid_r` 0.0295; **gain 8 → 0.8923 (GT 0.9023) / 0.0163**. 진폭을 키우면 상관이 내려간다 — MMSE 이론 그대로.
+
+### M18. `inter_subj_r` 는 진폭 지표다 (시뮬레이션, val GT)
+- var_ratio=1.0 이면 `resid_r` 0.074 든 1.0 이든 `inter_subj` 0.73~0.76. **0.8 은 gain 하나로 오늘 도달하지만 그때 퍼진 양의 99.5% 는 틀린 방향.** 진폭과 정확도(`resid_r`·식별)를 항상 같이 보고한다.
+
+### M19. `edge_head` / `count_head_end` 에 국소+티어1 통로 (`a3_aux` phase, `count_end` 가중치 분리)
+- 왜: val 10명 edge 선택 Jaccard **0.9896**, 확률 subject 성분 **1.6e-06** — "어떤 연결이 있는가"에서 개인차가 전부 지워진다. `count_end` 는 `w.count` 를 공유해 잔차 실험에서 **한 step 도 학습되지 않았다**.
+- 스모크 30 step: Jaccard 0.996 → 0.927, subject 성분 1.6e-06 → 1.8e-03. 본 학습(A3) 결과: 측정 중.
+
+### M20. subject 조건부 prior — 두 번 실패, 세 번째 설계
+- D-f (공유 MLP): prior mu subject 성분 **0.000154**. D-f' (pair 별 저랭크 [512→4→128], 1.7M): **0.000525**. 신호 상한은 posterior mu 기준 0.566 이고 split-half r=0.9956 으로 **재현되는 진짜 신호**다.
+- 진단: 용량이 아니라 손실. pair 평균이 `L_prior` 를 압도해 subject 잔차 기울기가 묻힌다 — count head 에서 템플릿을 뺀 것과 같은 상황.
+- D-f'' (`prior_res`: `r_q = mu_q − EMA_pair[mu_q]`, `r_p = mu_p − prior_mean`): 스모크 260 step 에서 `prior_res_r` 0.07 → **0.21**. 본 학습 결과: 측정 중.
+- 그 전에 잡은 것: `prior: 0.0` 이라 prior_local 이 학습 자체가 안 되던 것, 학습된 prior 를 "0-init 이어야 한다"고 우기던 낡은 자기검증, `resid_stats` 누락, 잘못된 조상(d3_joint) 에서 resume.
+
+### M21. 구조 상속 (`run.py`): resume checkpoint 의 가지를 config 대신 checkpoint 에서 읽는다
+- 왜: 단계마다 새 가지가 생겨 뒤 config 가 전부 재선언해야 했고, 하나 빠지면 "checkpoint 에만 있는 키" 로 죽었다 (A3 20:20, D4 는 그 후폭풍으로 삭제된 경로를 집음). 파이프라인에 단계 실패 시 중단(`need_ok`/`need_ck`) 추가.
+
+### M22. 국소 통로를 안 넘기던 옛 호출부 정리 (같은 원인, 10곳)
+`_recon_rmse`, `generate` 3곳, `prior_log_std`, `select_pairs`(no_grad), `allocate_counts`, 59번 prior_params, selfcheck self-edge pair 3곳. 공용 헬퍼 `roi_feats_if_needed`, `aux_feats_for` 로 한 곳에 모음.
+
+### 남은 것 (파이프라인 순서)
+D-f'' → A3 → D4(좌표 상자, 게이트 ≤4.0mm 미달 상태) → J1 joint(낮은 LR) → A/B(val) → **test 1회**.
+코드 미완: 최적 step checkpoint 보존, `weight_head` 제거.

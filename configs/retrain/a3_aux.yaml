@@ -1,0 +1,58 @@
+# A3 — 추론 경로의 두 head 를 subject feature 위에서 재학습한다
+#
+# 왜: 실측(val 10명, E6 checkpoint) edge_head 가 고르는 pair 집합의 Jaccard 가 **0.9896** 이다.
+# 10명 전원 공통이 1802 개, 합집합이 1821 개 -- "어떤 연결이 존재하는가"에서 개인차가 이미
+# 지워진다. count_head 를 아무리 잘 만들어도 여기서 걸러진 뒤다.
+# count_head_end(가닥 배분)도 같은 문제다: 잔차 목적으로 학습된 적이 없고 실측 r 0.57 로
+# 균등 배분(0.71)보다도 낮다.
+#
+# 재학습만으로는 부족하다 -- 두 head 가 전역 a512(subject 성분 2.1%)만 받고 있었다.
+# aux_local_dim / aux_tier1_dim 으로 국소 + 티어1(pair 별 가중치) 통로를 열었다. 전부 0-init
+# 이라 시작은 bit-exact 다.
+#
+# 고정: 인코더(동결), 디코더, prior, count_head(pair). 학습되는 것은 edge_head 와
+# count_head_end 뿐이다. resume 은 드라이버가 E 축 승자로 덮어쓴다.
+phase: a3_aux             # active = {"count", "edge"}
+subjects: outputs/splits/train.txt
+max_steps: 2000
+out_dir: outputs/checkpoints/retrain/a3_aux
+trainable: vae
+unet_level: none
+t1_source: rigid
+in_channels: 2
+template: true
+resume: outputs/checkpoints/retrain/a2_residual_D_local_t1fp0.1/a1_resid_step3000.pt
+log_every: 50
+save_every: 500
+
+train:
+  bn_mode: eval
+  sc_mode: pass
+  max_pairs_per_step: null
+  chunk: 2048
+  lr_t1: 0.0
+  lr_vae_enc: 0.0
+  lr_dec: 0.0
+  lr_heads: 3.0e-04
+  grad_clip: 50.0
+  seed: 0
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  sc_groups: block
+  resid_stats: outputs/cache/sc_template_stats.npz
+  tier1_stats: outputs/cache/anat_tier1_pair_stats.npz
+  # resume 대상(E 축 승자)이 이미 가진 count_head 가지를 그대로 선언해야 한다.
+  # 안 하면 모델이 그 가지 없이 만들어져 "checkpoint 에만 있는 키" 로 죽는다 (스모크에서 잡음).
+  count_local_dim: 512
+  count_tier1_dim: 9
+  aux_local_dim: 512        # edge_head / count_head_end 에 ROI 국소 anatomy
+  aux_tier1_dim: 9          # + 티어1 (자로 잰 해부량)
+  count_tier1_pair: true    # 티어1 을 pair 인덱스 가중치로 (프로브 ridge 와 동형)
+  tier1_wd: 0.1             # E6/E7 비교에서 0.1 이 1.0 보다 나았다
+  tier1_lr: 1.0e-03
+
+loss:
+  count: 0.0                # pair count head 절대 손실은 계속 끈다 (템플릿으로 기울기가 샌다)
+  count_end: 1.0            # 끝점 head 전용 -- 배분을 정하는 값이라 절대 크기가 필요하다
+  edge: 1.0

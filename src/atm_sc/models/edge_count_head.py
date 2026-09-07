@@ -41,10 +41,13 @@ def as_template(t, name: str = "template") -> torch.Tensor:
     return x
 
 
+from .pair_anchor import upper_index
+
+
 class EdgeCountHead(nn.Module):
     def __init__(self, anatomy_dim: int = 512, emb_dim: int = 64, hidden: int = 256,
                  init_log_count: float = 5.0, template=None, template_floor: float = 1e-2,
-                 local_dim: int = 0, tier1_dim: int = 0):
+                 local_dim: int = 0, tier1_dim: int = 0, tier1_n_roi: int = 0):
         """template: [R,R] train 평균 count. 주면 인수분해 모드 (없으면 기존 동작 그대로).
         template_floor: log(0) 을 피하는 바닥값. count < 1 은 "생성 0 개" 라 1e-2 는 0 과 같다.
 
@@ -81,6 +84,18 @@ class EdgeCountHead(nn.Module):
             self.tier1_proj = nn.Sequential(nn.Linear(self.tier1_dim, hidden), nn.GELU(),
                                             nn.Linear(hidden, hidden))
             nn.init.zeros_(self.tier1_proj[-1].weight); nn.init.zeros_(self.tier1_proj[-1].bias)
+        # pair 인덱스 가중치. 왜 필요한가 -- 프로브의 ridge 는 3321 pair x 9 feature 를 편 채
+        # pair 마다 독립 가중치 29,889 개로 r=0.1305 를 냈는데, 위 tier1_proj 는 모든 pair 가
+        # 가중치를 공유한다. tier1 신호가 pair 마다 다른 방향이면 (거리가 지배하는 pair,
+        # WM 부피가 지배하는 pair) 공유 가중치로는 표현이 안 된다. 실측: 공유 배선 E5 의
+        # resid_r 이 0.0354 로 프로브의 1/4 에 그쳤다. 여기서는 ridge 와 **동형**으로 만든다.
+        # 출력 log-count 에 직접 더한다 (ridge 가 잔차를 직접 예측한 것과 같은 자리).
+        self.tier1_n_roi = int(tier1_n_roi)
+        self.tier1_w = self.tier1_b = None
+        if self.tier1_dim and self.tier1_n_roi:
+            n_pair = self.tier1_n_roi * (self.tier1_n_roi - 1) // 2
+            self.tier1_w = nn.Parameter(torch.zeros(n_pair, self.tier1_dim))
+            self.tier1_b = nn.Parameter(torch.zeros(n_pair))
 
     def _template_term(self, pairs, k: int, device) -> torch.Tensor:
         assert pairs is not None, "템플릿 인수분해 head 는 pair 인덱스가 필요하다 (forward(..., pairs=...))"
@@ -117,25 +132,31 @@ class EdgeCountHead(nn.Module):
         else:
             assert tier1 is None, "tier1_dim = 0 인데 tier1 feature 가 넘어왔다"
         out = self.net[1:](h).squeeze(-1)
+        if self.tier1_w is not None:
+            assert pairs is not None, "pair 별 tier1 가중치는 pair 인덱스가 필요하다"
+            idx = upper_index(pairs[:, 0].long(), pairs[:, 1].long(), self.tier1_n_roi)
+            out = out + (self.tier1_w[idx] * tier1).sum(-1) + self.tier1_b[idx]
         if self.template_log is not None:
             out = out + self._template_term(pairs, k, out.device)
         return out
 
     def count(self, anatomy: torch.Tensor, pair_vec: torch.Tensor,
               pairs: torch.Tensor | None = None,
-              local: torch.Tensor | None = None) -> torch.Tensor:
+              local: torch.Tensor | None = None,
+              tier1: torch.Tensor | None = None) -> torch.Tensor:
         """exp(log_count) [K]. 항상 >= 0."""
-        return torch.exp(self.forward(anatomy, pair_vec, pairs, local))
+        return torch.exp(self.forward(anatomy, pair_vec, pairs, local, tier1))
 
     def matrix(self, anatomy: torch.Tensor, pair_vec: torch.Tensor, pairs: torch.Tensor,
-               n_roi: int) -> torch.Tensor:
+               n_roi: int, local: torch.Tensor | None = None,
+               tier1: torch.Tensor | None = None) -> torch.Tensor:
         """예측 count 를 대칭 [n_roi, n_roi] 로 흩뿌린다 (대각 0). 안 나온 pair 는 0 이다."""
         assert pairs.ndim == 2 and pairs.shape[1] == 2, pairs.shape
         assert pairs.shape[0] == pair_vec.shape[0], (pairs.shape, pair_vec.shape)
         i, j = pairs[:, 0].long(), pairs[:, 1].long()
         assert int(i.min()) >= 0 and int(torch.maximum(i, j).max()) < n_roi, "ROI 인덱스 범위 밖"
         assert bool((i != j).all()), "self-edge (i==j) 는 SC 에 없다 — 대각은 0 이어야 한다"
-        c = self.count(anatomy, pair_vec, pairs)
+        c = self.count(anatomy, pair_vec, pairs, local, tier1)
         m = torch.zeros(n_roi, n_roi, dtype=c.dtype, device=c.device)
         # (i,j) 와 (j,i) 를 함께 넣어 대칭을 구조적으로 보장한다. 같은 pair 가 중복되면
         # accumulate 로 합쳐진다 (count 는 가산량).

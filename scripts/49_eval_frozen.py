@@ -37,11 +37,11 @@ from atm_sc.evaluation.reproduction_metrics import (ablation_gap, bundle_distanc
                                                     endpoint_distance, length_distribution,
                                                     stratified_corr, subject_specificity,
                                                     valid_connection_rate)
-from atm_sc.inference.generate_sc import (allocate_counts, generate_by_count, generate_tractogram,  # noqa: E402
+from atm_sc.inference.generate_sc import (allocate_counts, pair_residual_log, generate_by_count, generate_tractogram,  # noqa: E402
                                           save_trk, select_pairs, template_counts, tractogram_sc)
 from atm_sc.inference.latent_bank import LatentBank                                 # noqa: E402
 from atm_sc.models.roi_atm import ROIPairATM, from_checkpoint                                        # noqa: E402
-from atm_sc.training.run import anatomy_feature, t1_input                           # noqa: E402
+from atm_sc.training.run import anatomy_feature, t1_input, roi_feats_if_needed                           # noqa: E402
 
 
 def group_template(subjects) -> np.ndarray:
@@ -199,16 +199,67 @@ def _masks(subj):
     return {k: v for k, v in m.items() if v.any()}
 
 
+def aux_feats(m, sub, n_roi, a, dev):
+    """edge_head / count_head_end 용 [3321, D]. 전체 upper pair 순서다."""
+    h = m.edge_head
+    if h is None or not (getattr(h, "local_dim", 0) or getattr(h, "tier1_dim", 0)):
+        return None, None
+    iu = np.stack(np.triu_indices(n_roi, 1), 1)
+    P = torch.as_tensor(iu, device=dev)
+    loc = t1f = None
+    if int(getattr(h, "local_dim", 0) or 0):
+        from atm_sc.data.local_feats import load_roi_feats, pair_local
+        loc = pair_local(load_roi_feats(sub, a.t1_src, dev, n_roi=n_roi), P)
+    if int(getattr(h, "tier1_dim", 0) or 0):
+        from atm_sc.data.anat_tier1 import pair_input
+        assert a.tier1_stats is not None, "aux tier1 head 인데 통계가 안 실렸다"
+        t1f = torch.as_tensor(pair_input(sub, a.tier1_stats, a.t1_src), device=dev)
+    return loc, t1f
+
+
+def head_feats(m, sub, pairs, a, dev):
+    """count head 가 국소/tier1 통로로 만들어졌으면 그 입력을 만든다. 아니면 (None, None).
+
+    예전에는 여기서 안 만들어 넘겨서, 국소 통로를 켠 checkpoint 로 추론하면 head 의 assert 에
+    걸렸다 -- 즉 개인차를 학습한 head 를 추론이 아예 못 쓰고 있었다."""
+    h = m.count_head
+    if h is None:
+        return None, None
+    P = torch.as_tensor(np.asarray(pairs, np.int64), device=dev)
+    loc = t1f = None
+    if int(getattr(h, "local_dim", 0) or 0):
+        from atm_sc.data.local_feats import load_roi_feats, pair_local
+        loc = pair_local(load_roi_feats(sub, a.t1_src, dev, n_roi=m.n_roi), P)
+    if int(getattr(h, "tier1_dim", 0) or 0):
+        from atm_sc.data.anat_tier1 import pair_input
+        assert a.tier1_stats is not None, "tier1 head 인데 통계가 안 실렸다"
+        t1f = torch.as_tensor(pair_input(sub, a.tier1_stats, a.t1_src), device=dev)[
+            _pair_rows(pairs, m.n_roi)]
+    return loc, t1f
+
+
+def _pair_rows(pairs, n_roi):
+    """pair_input 은 3321 개 전체 upper pair 순서다. 고른 pair 만 뽑는다."""
+    from atm_sc.models.pair_anchor import upper_index
+    pr = torch.as_tensor(np.asarray(pairs, np.int64))
+    lo = torch.minimum(pr[:, 0], pr[:, 1]); hi = torch.maximum(pr[:, 0], pr[:, 1])
+    return upper_index(lo, hi, n_roi)
+
+
 def evaluate_subject(m, sub, atlas, affine, a, dev):
     subj = ROIPairSubject(sub)
     t0 = time.time()
     with torch.no_grad():
         feat = (anatomy_feature(m, sub, a.init_bundle) if m.unet_level == "none"
                 else m.atm.encode_anatomy(t1_input(m, sub, a.t1_src)))          # T1 -> anatomy (입력은 T1 뿐)
-        pairs, prob = select_pairs(m, feat, subj.n_roi, thr=a.edge_thr)
+        al, at = aux_feats(m, sub, subj.n_roi, a, dev)
+        pairs, prob = select_pairs(m, feat, subj.n_roi, thr=a.edge_thr, local=al, tier1=at)
         assert len(pairs) > 0, f"{sub}: edge head 가 고른 pair 가 없음 (thr={a.edge_thr})"
-        S, w, pr = generate_tractogram(m, feat, pairs, a.n_per_pair, seed=0)
-        cnt_mat = (m.edge_count_matrix(feat, torch.as_tensor(pairs, device=dev)).cpu().numpy()
+        roi = roi_feats_if_needed(m, sub, a.t1_src)
+        S, w, pr = generate_tractogram(m, feat, pairs, a.n_per_pair, seed=0, local_roi=roi)
+        loc, t1f = head_feats(m, sub, pairs, a, dev)
+        cnt_mat = (m.edge_count_matrix(feat, torch.as_tensor(pairs, device=dev),
+                                       loc, t1f).cpu().numpy()
                    if m.count_head is not None else None)
     t_gen = time.time() - t0
     sc = tractogram_sc(S, w, atlas, affine, subj.n_roi)
@@ -223,7 +274,15 @@ def evaluate_subject(m, sub, atlas, affine, a, dev):
         if a.alloc_template is not None:
             nall = template_counts(a.alloc_template, pairs, a.total_streamlines or 460_000)
         else:
-            nall = allocate_counts(m, feat, pairs, total=a.total_streamlines)
+            rl = (pair_residual_log(m, feat, pairs, a.template_log1p, loc, t1f)
+                  if a.resid_alloc else None)
+            ai = _pair_rows(pairs, m.n_roi)
+            nall = allocate_counts(m, feat, pairs, total=a.total_streamlines,
+                                   resid_log=rl, resid_gain=a.resid_gain,
+                                   local=None if al is None else al[ai],
+                                   tier1=None if at is None else at[ai])
+            if rl is not None:
+                out["resid_log_sd"] = float(np.std(rl))
         sc_a, n_gen, S2 = generate_by_count(m, feat, pairs, nall, atlas, affine, subj.n_roi,
                                             keep=a.trk, bank=a.bank)
         if a.bank is not None:
@@ -340,6 +399,20 @@ def main(a):
     subs = [s for s in subs if (CACHE / f"{s}_T1w_syn_W.npy").exists()]
     a.total_streamlines = a.total_streamlines or None
     a.bank = a.alloc_template = None
+    a.template_log1p = a.tier1_stats = None
+    if a.resid_alloc or any(int(getattr(h, "tier1_dim", 0) or 0) for h in (m.count_head, m.edge_head, m.count_head_end) if h is not None):
+        z = np.load(ROOT / "outputs/cache/sc_template_stats.npz", allow_pickle=False)
+        R = int(z["n_roi"]); iu = np.triu_indices(R, 1)
+        a.template_log1p = np.zeros((R, R), np.float64)
+        a.template_log1p[iu] = z["template"]; a.template_log1p.T[iu] = z["template"]
+        assert int(z["n_subjects"]) == 144, f"템플릿이 train 144명이 아니다 ({int(z['n_subjects'])})"
+    if any(int(getattr(h, "tier1_dim", 0) or 0) for h in (m.count_head, m.edge_head, m.count_head_end) if h is not None):
+        from atm_sc.data.anat_tier1 import STATS_PATH
+        assert STATS_PATH.exists(), "scripts/55_anat_tier1.py 를 먼저 실행"
+        z1 = np.load(STATS_PATH, allow_pickle=False)
+        a.tier1_stats = {k: z1[k] for k in z1.files}
+        tr = [l.strip() for l in (ROOT / "outputs/splits/train.txt").read_text().splitlines() if l.strip()]
+        assert list(z1["subjects"]) == tr, "tier1 통계가 train split 으로 만들어지지 않았다 (누수)"
     if a.use_bank:
         bp, tp = ROOT / "outputs/inference/latent_bank.npz", ROOT / "outputs/inference/template.npz"
         assert bp.exists() and tp.exists(), "scripts/34_build_inference_prior.py 를 먼저 실행"
@@ -494,6 +567,10 @@ if __name__ == "__main__":
                     help="오라클 whole-brain dice 표본 가닥 수 (W1-b 보정곡선과 같은 8000)")
     ap.add_argument("--oracle-pair-max", type=int, default=256,
                     help="오라클 pair dice 에서 번들당 최대 가닥 수")
+    ap.add_argument("--resid-alloc", action="store_true",
+                    help="pair count head 의 subject 잔차로 가닥 배분을 변조한다. 끝점 head 는 "
+                         "잔차 목적으로 학습된 적이 없어 그 개인차는 잡음이다")
+    ap.add_argument("--resid-gain", type=float, default=1.0)
     ap.add_argument("--use-bank", action="store_true",
                     help="배분=train 템플릿, latent=train bank (재학습 없이 SC r 0.71 -> 0.88). --by-count 와 같이 쓴다")
     ap.add_argument("--by-count", action="store_true",

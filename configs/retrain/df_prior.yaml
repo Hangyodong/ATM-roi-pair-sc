@@ -28,7 +28,7 @@ unet_level: none          # UNet 동결 -> anatomy 는 디스크 캐시 (W4 프�
 t1_source: rigid
 in_channels: 2
 template: true
-resume: outputs/checkpoints/retrain/d3_joint/d3_joint_step3000.pt
+resume: outputs/checkpoints/retrain/e4_unet_D_local_t1fp0.1/a1_resid_step3000.pt  # E8 (E 축 승자)
 log_every: 50
 save_every: 500
 
@@ -49,7 +49,17 @@ train:
   cudnn_benchmark: true
   sc_groups: block
   resid_beta: 1.0
+  # res/res_corr/diff 손실은 train 전용 log1p 템플릿을 요구한다 (data/sc_template.py).
+  # 54번 드라이버는 이걸 코드에서 넣어주지만 49_d3_joint 는 config 에서 읽는다.
+  resid_stats: outputs/cache/sc_template_stats.npz
+  count_tier1_dim: 9
+  count_tier1_pair: true
+  tier1_stats: outputs/cache/anat_tier1_pair_stats.npz
   prior_local_dim: 512    # D-f: pair 의존 subject 조건부 prior
+  prior_local_rank: 4     # ★ 공유 MLP 는 실패했다 (신호 0.566 중 0.000154 만 학습).
+                          # pair 별 저랭크 [512->4->128], 3321*4*128 = 1.7M.
+  tier1_wd: 0.1           # 1.7M / 144명 -- 정규화 없이는 과적합한다
+  tier1_lr: 1.0e-03
   cond_local_dim: 512
   count_local_dim: 512         # SmoothL1 beta (정규화 잔차 단위이므로 1.0 = 1 sigma)
 
@@ -58,3 +68,15 @@ loss:
   res: 1.0
   res_corr: 0.2
   diff: 0.2
+  # D-f 의 핵심. prior_local 은 **이 항 하나로만** gradient 를 받는다 -- KL 은 prior 를 detach 하고
+  # (C11), 생성 경로는 log_sigma 를 detach 한다. prior: 0 으로 두면 subject 조건부 prior 가
+  # 배선만 되고 한 step 도 학습되지 않는다. d3_joint 와 같은 0.1 을 쓴다 (64차 합 로그우도라
+  # 값 자체가 커서 초기 ~65).
+  prior: 0.1
+  seg_prior: 0.0
+  # D-f'' 의 핵심 -- subject 잔차 적합항. 왜 (실측): posterior mu 의 subject 잔차는 split-half
+  # r=0.9956 으로 재현되는 진짜 신호인데, 위 prior 항 하나로는 pair 별 저랭크 가지를 달아도
+  # subject 성분을 0.000525 (상한 0.566 의 0.09%) 만 배웠다. pair 평균이 손실을 압도한다.
+  # count_head 에서 템플릿을 빼고 잔차만 맞춰 resid_r 0.009 -> 0.124 를 얻은 처방과 같다.
+  prior_res: 1.0
+  prior_res_corr: 0.2

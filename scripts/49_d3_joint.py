@@ -41,7 +41,7 @@ from atm_sc.models import latent_prior as lp                            # noqa: 
 from atm_sc.models.roi_atm import from_checkpoint                       # noqa: E402
 from atm_sc.models.roi_pair_embedding import ROIPairEmbedding, canonical_pairs  # noqa: E402
 from atm_sc.training import config as C                                 # noqa: E402
-from atm_sc.training.run import anatomy_feature, recon_rmse_metrics, run  # noqa: E402
+from atm_sc.training.run import anatomy_feature, recon_rmse_metrics, roi_feats_if_needed, run  # noqa: E402
 from atm_sc.training.trainer import Trainer                             # noqa: E402
 
 LOCK = ROOT / "outputs/gpu.lock"
@@ -82,7 +82,8 @@ def selfcheck(ckpt: Path | None, device: str) -> dict:
     e = ROIPairEmbedding(82, 64, 512, latent_dim=64)
     with torch.no_grad():
         e.prior_mu.weight.normal_(std=0.2); e.prior_mu.bias.normal_(std=0.2)
-    p = canonical_pairs(torch.randint(0, 82, (128, 2)))
+    _iu0 = torch.as_tensor(np.stack(np.triu_indices(82, 1), 1))   # i == j (self-edge) 를 피한다
+    p = canonical_pairs(_iu0[torch.randperm(len(_iu0))[:128]])
     mu, ls = e.prior_params(p)
     assert torch.equal(ls, torch.zeros_like(ls)), "prior_log_sigma 가 0-init 이 아니다"
     ga = torch.Generator().manual_seed(7); gb = torch.Generator().manual_seed(7)
@@ -127,23 +128,44 @@ def selfcheck(ckpt: Path | None, device: str) -> dict:
         m, _ = from_checkpoint(ckpt, device=device)
         pe = m.pair_emb
         assert not pe.prior_use_anatomy, "prior_use_anatomy 가 켜져 있다 (0-init 로 꺼 두기로 했다)"
-        pp = canonical_pairs(torch.randint(0, m.n_roi, (256, 2), device=m.device))
-        ls_ck = pe.prior_log_std(pp)
+        # randint 두 번은 i == j 를 만든다 (self-edge). upper triangle 에서 뽑아야 한다.
+        _iu = torch.as_tensor(np.stack(np.triu_indices(m.n_roi, 1), 1), device=m.device)
+        pp = canonical_pairs(_iu[torch.randperm(len(_iu), device=m.device)[:256]])
+        # 진단이라 국소 입력은 0 으로 둔다. 아래 모든 비교가 **같은** 입력을 쓰게 하려면
+        # 여기서 한 번 만들어 전부에 넘겨야 한다 (한쪽만 다르면 비교 자체가 성립 안 한다).
+        pl0 = (torch.zeros(pp.shape[0], pe.prior_local_dim, device=m.device)
+               if pe.prior_local is not None else None)
+        ls_ck = pe.prior_log_std(pp, local=pl0)
         g1 = torch.Generator(device=m.device); g1.manual_seed(11)
         g2 = torch.Generator(device=m.device); g2.manual_seed(11)
         z_old = m.prior_mean(pp) + torch.randn(256, 64, device=m.device, generator=g1)
-        z_new = m.sample_z(pp, g2)
+        z_new = m.sample_z(pp, g2, local=pl0)
         # 학습 중 생성 경로가 쓰는 식도 같은지 (trainer.gen_chunk 의 zc)
         e_ = torch.randn(256, 64, device=m.device)
-        mu_ck, ls2 = m.prior_params(pp)
+        mu_ck, ls2 = m.prior_params(pp, local=pl0)
         z_gen_old = m.prior_mean(pp) + e_
         z_gen_new = mu_ck + torch.exp(ls2.detach()) * e_
-        out["ckpt_gen_z_bit_exact"] = bool(torch.equal(z_gen_old, z_gen_new))
-        assert out["ckpt_gen_z_bit_exact"], "0-init 인데 생성 경로 z 가 달라졌다"
         out["ckpt_prior_log_sigma_absmax"] = float(ls_ck.abs().max())
+        # log_sigma 가 0 이면 구 checkpoint 라 `mu + eps` 와 bit-exact 여야 한다. 하지만 D3 가
+        # 실제로 돌면 prior scale 이 학습돼 0 이 아니게 된다 -- 그때 bit-exact 를 요구하면
+        # "D3 를 돌렸다는 이유로 D3 후속이 못 돌아가는" 낡은 검증이 된다. 실측: d3_joint_step3000
+        # 의 |log_sigma|max = 4.30 (평균 sigma 0.36). 그래서 조건을 나눈다.
+        untrained = out["ckpt_prior_log_sigma_absmax"] == 0.0
+        out["ckpt_prior_untrained"] = bool(untrained)
+        out["ckpt_gen_z_bit_exact"] = bool(torch.equal(z_gen_old, z_gen_new))
         out["ckpt_sample_z_bit_exact"] = bool(torch.equal(z_old, z_new))
-        assert out["ckpt_prior_log_sigma_absmax"] == 0.0, "구 checkpoint 인데 log_sigma 가 0 이 아니다"
-        assert out["ckpt_sample_z_bit_exact"], "구 checkpoint 에서 sample_z 가 달라졌다"
+        if untrained:
+            assert out["ckpt_gen_z_bit_exact"], "0-init 인데 생성 경로 z 가 달라졌다"
+            assert out["ckpt_sample_z_bit_exact"], "구 checkpoint 에서 sample_z 가 달라졌다"
+        else:
+            # 학습된 prior 에서는 sample_z 가 **현행 식**과 일치하는지를 본다 (이게 진짜 불변식).
+            g3 = torch.Generator(device=m.device); g3.manual_seed(11)
+            g4 = torch.Generator(device=m.device); g4.manual_seed(11)
+            z_ref = mu_ck + torch.exp(ls2) * torch.randn(256, 64, device=m.device, generator=g3)
+            out["ckpt_sample_z_matches_formula"] = bool(torch.equal(
+                z_ref, m.sample_z(pp, g4, local=pl0)))
+            assert out["ckpt_sample_z_matches_formula"], \
+                "학습된 prior 인데 sample_z 가 mu + exp(log_sigma)*eps 와 다르다"
         del m
         torch.cuda.empty_cache()
     return out
@@ -167,7 +189,8 @@ def gen_probe(model, subs: list[str], atlas, affine, source: str, n_pairs: int =
         ks = s.sample_pairs(min(n_pairs, len(s.pair_ids)), rng, mode="tier")
         P = torch.as_tensor(np.asarray(s.pair_ids)[ks], device=model.device)
         g = torch.Generator(device=model.device); g.manual_seed(seed)
-        S, _, pr = model.generate(a, P, n_per_pair, generator=g)
+        S, _, pr = model.generate(a, P, n_per_pair, generator=g,
+                                  local_roi=roi_feats_if_needed(model, sub, source))
         Sn = S.detach().cpu().numpy()
         assert np.isfinite(Sn).all(), "생성 좌표에 NaN/Inf"
         acc.append(valid_connection_rate(Sn, pr.detach().cpu().numpy(), atlas, affine, s.n_roi))
@@ -185,7 +208,8 @@ def measure(ckpt: Path, val_subs, dev, atlas, affine, n_val, n_val_pairs, n_per_
                                   n_per_pair=n_per_pair, seed=0, source=src))
     out.update(gen_probe(m, probe_subs, atlas, affine, src, n_pairs=probe_pairs))
     gp = torch.Generator(device="cpu"); gp.manual_seed(0)
-    pp = canonical_pairs(torch.randint(0, m.n_roi, (512, 2), generator=gp).to(m.device))
+    _iu1 = torch.as_tensor(np.stack(np.triu_indices(m.n_roi, 1), 1))
+    pp = canonical_pairs(_iu1[torch.randperm(len(_iu1), generator=gp)[:512]].to(m.device))
     with torch.no_grad():
         ls = m.pair_emb.prior_log_std(pp)
     out["prior_log_sigma_mean"] = float(ls.mean())
@@ -434,6 +458,8 @@ if __name__ == "__main__":
     ap.add_argument("--probe-pairs", type=int, default=256)
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--subjects-limit", type=int, default=0)
+    ap.add_argument("--no-lock", action="store_true",
+                    help="GPU lock 우회. prior 만 학습하는 D-f 는 ~2GB 라 병렬이 가능하다")
     ap.add_argument("--sweep", default="", help="예: A,B,C")
     ap.add_argument("--sweep-steps", type=int, default=800)
     ap.add_argument("--sweep-only", action="store_true")
@@ -450,7 +476,12 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if args.assemble:
         sys.exit(main(args))
-    if not acquire_lock(LOCK):
+    if args.no_lock:
+        import torch as _t
+        free = (_t.cuda.mem_get_info()[0] / 1e9) if _t.cuda.is_available() else 0.0
+        print(f"[d3] lock 우회 (--no-lock). GPU 여유 {free:.1f} GB", flush=True)
+        assert free > 4.0, f"GPU 여유가 {free:.1f} GB 뿐이다 -- 병렬로 돌리면 죽는다"
+    elif not acquire_lock(LOCK):
         sys.exit(3)
     try:
         sys.exit(main(args))

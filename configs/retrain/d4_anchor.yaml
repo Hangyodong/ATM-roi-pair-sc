@@ -27,18 +27,31 @@
 # 앵커가 나쁜 초기값이므로 alpha=1 에서 손해가 날 수 있다 -- 결과를 valid/invalid 로 나눠 본다.
 phase: d1_decoder         # active = {"recon"}
 subjects: outputs/splits/train.txt
-max_steps: 3000
+max_steps: 2500            # 마지막 체크포인트만 남으므로 max_steps 가 곧 모델 선택이다.
+                           # 실측 최적: E8 gap 0.0704/식별 0.258 @2500, E6 0.0692 @2250,
+                           # E4 는 2250 이후 붕괴. 2000 은 최적 **이전**이라 손해다.
 out_dir: outputs/checkpoints/retrain/d4_anchor
 trainable: vae
 unet_level: none
 t1_source: rigid
 in_channels: 2
 template: true
-resume: outputs/checkpoints/retrain/d3_joint/d3_joint_step3000.pt
+resume: /scratch/home/wog3597/ATM/outputs/checkpoints/retrain/a3_aux_smoke/a3_aux_step30.pt
 log_every: 50
 save_every: 500
 
 train:
+  # 앞 단계(E/D-f/A3)가 만든 가지를 전부 선언한다. 하나라도 빠지면 모델이 그 가지 없이
+  # 만들어져 "checkpoint 에만 있는 키" 로 죽는다 (A3 스모크에서 실제로 겪었다).
+  count_local_dim: 512
+  count_tier1_dim: 9
+  count_tier1_pair: true
+  aux_local_dim: 512
+  aux_tier1_dim: 9
+  prior_local_dim: 512
+  cond_local_dim: 512
+  tier1_stats: outputs/cache/anat_tier1_pair_stats.npz
+
   bn_mode: eval           # D1 이 남긴 running 통계를 얼린다
   sc_mode: pass
   max_pairs_per_step: null
