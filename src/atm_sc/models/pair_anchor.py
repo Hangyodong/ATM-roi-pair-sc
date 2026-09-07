@@ -56,7 +56,7 @@ class PairAnchor(nn.Module):
         assert float(h.min()) > 0, f"half_range 에 0 이하가 있다 ({float(h.min())}) -- 재매개화가 죽는다"
         self.n_roi = int(n_roi)
         self.register_buffer("anchor", a)
-        self.register_buffer("half", h)
+        self.register_buffer("half_range", h)
         self.register_buffer("valid", v)
         # alpha 는 학습 대상이 아니라 스케줄 값이다. buffer 라 checkpoint 에 같이 저장된다.
         self.register_buffer("alpha", torch.tensor(float(alpha)))
@@ -74,7 +74,7 @@ class PairAnchor(nn.Module):
         assert pairs.shape == (raw.shape[0], 2), (pairs.shape, raw.shape)
         idx = upper_index(pairs[:, 0], pairs[:, 1], self.n_roi)
         assert int(idx.max()) < self.anchor.shape[0], (int(idx.max()), self.anchor.shape)
-        mm_anchor = self.anchor[idx] + self.half[idx].unsqueeze(1) * raw
+        mm_anchor = self.anchor[idx] + self.half_range[idx].unsqueeze(1) * raw
         al = self.alpha
         return (1.0 - al) * mm_global + al * mm_anchor
 

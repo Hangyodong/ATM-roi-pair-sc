@@ -485,7 +485,7 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
             k = int(rng.integers(len(subs) - 1))
             s2 = subs[k] if subs[k].sub != s.sub else subs[-1]
             partner = (s2, anat(s2))
-        o = tr.step(s, anat(s), partner=partner)
+        o = tr.step(s, anat(s), partner=partner, step=step)
         o.update(step=step, subject=s.sub, phase=phase, elapsed=time.time() - t0)
         log.write(json.dumps({k: (v if isinstance(v, (int, float, str)) else float(v)) for k, v in o.items()}) + "\n")
         log.flush()

@@ -113,6 +113,10 @@ class TrainConfig:
     cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
     pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
     anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
+    anchor_alpha_steps: int = 0           # >0 이면 alpha 를 0 -> anchor_alpha_end 로 선형 램프업.
+                                          # 재매개화는 출력의 의미를 바꾸므로 한 번에 켜면
+                                          # 디코더가 무너진다. 램프업이 그걸 막는다.
+    anchor_alpha_end: float = 1.0
     local_source: str = "rigid"           # 그 캐시의 프로토콜 (s1b_feats/{sub}_{source}.npz)
     resid_beta: float = 1.0               # SmoothL1 의 beta (정규화 잔차 단위)
     resid_momentum: float = 0.02          # ResidualCorr 의 subject 평균 EMA 계수
@@ -257,10 +261,14 @@ class Trainer:
         return t(w), t(l)
 
     # ------------------------------------------------------------------------------
-    def step(self, subject, anat_input: torch.Tensor, partner=None) -> dict:
-        """partner = (ROIPairSubject, anat_input) -- L_diff 용 두 번째 subject (§5)."""
+    def step(self, subject, anat_input: torch.Tensor, partner=None, step: int | None = None) -> dict:
+        """partner = (ROIPairSubject, anat_input) -- L_diff 용 두 번째 subject (§5).
+        step 은 pair 앵커 alpha 램프업에만 쓴다 (학습 스케줄)."""
         m, cfg, w = self.model, self.cfg, self.w
         m.train()
+        if cfg.anchor_alpha_steps and m.anchor is not None:
+            assert step is not None, 'alpha 램프업인데 step 이 안 넘어왔다'
+            m.anchor.set_alpha(min(1.0, step / cfg.anchor_alpha_steps) * cfg.anchor_alpha_end)
         if cfg.bn_mode != "train":
             # ConvVAE BN 만 eval 로 고정. 이렇게 해야 학습 중의 복원과 추론의 복원이 같은
             # 함수다 (안 하면 로그의 3.55 mm 가 추론에서 8.46 mm 로 나온다).
