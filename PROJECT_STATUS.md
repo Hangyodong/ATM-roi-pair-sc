@@ -108,6 +108,7 @@ MRtrix/FreeSurfer/MATLAB/DSI Studio/singularity 없음 (불필요). `/mnt/d` 의
     기준선(SC 0.841 / dice 0.574)보다도 낮다. -> 개인차 결손과 **그룹 재현 열위**는 별개의 두 결손이다.
 - **요약 문서 2개 — 먼저 읽을 것. 나머지 docs/ 는 이력이다.**
   - `docs/PIPELINE_13_CHANGE_LOG.md` — 무엇을 어떻게 고쳤고 그 결과 숫자가 어떻게 변했나 (M1~M12, 순효과표).
+  - `docs/PIPELINE_14_ENCODER_DECODER.md` — 인코더·디코더 수정 파이프라인 (E1~E5 / D-a~D-e, 게이트, 현재 상태).
   - `docs/PIPELINE_12_PROBLEM_SUMMARY.md` — 남은 문제, 실험 원장, 기준선 대조표, 확정/미확정 구분.
 - **문제 목록**: `docs/PIPELINE_09_PROBLEM_INVENTORY.md` — 단계별 문제를 축 A(개인차)/B(기하)/C(지표·절차) 로 재정리. 순서 제약: A3 공간 대응 → A1 pooling → A2 조건 주입. C1·C2 는 코드 수정 없이 즉시 수정 가능.
 - **해결 계획**: `docs/PIPELINE_10_RESOLUTION_PLAN.md` — S0 계측 고정 → S1 공간 결정 실험(전체 게이트) → S2 ROI 국소 조건화 → S3 파일럿 → 분기. GPU 1장이라 GPU 구간은 직렬(lock), 나머지만 병렬.
