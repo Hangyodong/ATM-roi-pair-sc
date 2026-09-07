@@ -110,6 +110,7 @@ class TrainConfig:
     sc_groups: str | None = "block"      # SC loss 를 ctx-ctx/ctx-sub/sub-sub 로 나눠 평균 (None = whole-brain 하나)
     resid_stats: str | None = None        # train split 전용 SC 통계 npz (data/sc_template.py)
     count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
+    cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
     local_source: str = "rigid"           # 그 캐시의 프로토콜 (s1b_feats/{sub}_{source}.npz)
     resid_beta: float = 1.0               # SmoothL1 의 beta (정규화 잔차 단위)
     resid_momentum: float = 0.02          # ResidualCorr 의 subject 평균 EMA 계수
@@ -171,6 +172,9 @@ class Trainer:
         # 전략 문서 §1.2-1.4. template/std/mask 는 train split 에서만 온다 (누수 방지).
         # ROI 국소 anatomy (전략 문서 §3.2). global avg pool 이 지운 개인차를 head 에 되돌린다.
         self._local = {}                     # subject -> [R, D] (subject 당 1회 로드)
+        if cfg.cond_local_dim:
+            assert model.pair_emb.local_dim == cfg.cond_local_dim, (
+                'pair_emb 의 local_dim 이 config 와 다르다', model.pair_emb.local_dim, cfg.cond_local_dim)
         if cfg.count_local_dim:
             assert model.count_head is not None and model.count_head.local_dim == cfg.count_local_dim, (
                 'count head 의 local_dim 이 config 와 다르다 -- 모델을 count_local_dim 으로 만들어야 한다',
@@ -219,6 +223,16 @@ class Trainer:
         assert cfg.bn_mode in ("train", "eval", "recal_eval"), cfg.bn_mode
         self.ae_bns = [b for b in model.atm.net.ae.modules() if isinstance(b, torch.nn.BatchNorm1d)]
         assert self.ae_bns, "ConvVAE 에서 BatchNorm1d 를 하나도 못 찾았다 (구조가 바뀌었나?)"
+
+    def cond_local(self, sub: str, pairs: torch.Tensor) -> torch.Tensor | None:
+        """디코더 조건용 [K, cond_local_dim]. cond_local_dim = 0 이면 None."""
+        if not self.cfg.cond_local_dim:
+            return None
+        from ..data.local_feats import load_roi_feats
+        if sub not in self._local:
+            self._local[sub] = load_roi_feats(sub, self.cfg.local_source, self.device,
+                                              n_roi=self.model.n_roi)
+        return L_local.pair_local(self._local[sub], pairs)
 
     def local_feat(self, sub: str) -> torch.Tensor | None:
         """subject 의 ROI 국소 anatomy [R, D]. count_local_dim = 0 이면 None."""
@@ -286,7 +300,7 @@ class Trainer:
         def gen_chunk(i, grad):
             with (torch.enable_grad() if grad else torch.no_grad()):
                 pc = pairs[i:i + cfg.chunk]
-                c = m.condition(a_leaf, pc)
+                c = m.condition(a_leaf, pc, local=self.cond_local(subject.sub, pc))
                 # 추론(`roi_atm.sample_z`)과 **같은 분포**에서 뽑아야 생성 제약이 실제로 쓰이는
                 # 영역을 학습한다. log_sigma 0-init 이면 exp(0)=1 이라 기존 `prior_mean + eps` 와
                 # bit-exact 같다. sigma 는 detach 한다 -- 안 그러면 endpoint/SC 손실이 sigma 를
@@ -428,7 +442,7 @@ class Trainer:
                 S_gt = torch.cat(Ss).to(self.device).float(); P_gt = torch.cat(Ps).to(self.device)
                 V_gt = torch.cat(Vs).to(self.device) if Vs else None
                 rw = None
-            c = m.condition(a_leaf, P_gt)
+            c = m.condition(a_leaf, P_gt, local=self.cond_local(subject.sub, P_gt))
             mu, logvar = m.encode_streamlines(S_gt, c)
             rec = m.decode(m.reparameterize(mu, logvar), c)
             l_rec = L.stream_recon_loss(rec, S_gt, weights=rw)
@@ -482,7 +496,8 @@ class Trainer:
             S_sg, P_sg, L_sg, sinfo = ss.sample_batch(self.rng, cfg.seg_edges_per_step, cfg.n_seg_per_edge)
             out.update(sinfo)
             S_sg, P_sg = S_sg.to(self.device), P_sg.to(self.device)
-            c = m.condition(a_leaf, P_sg, mode=1)                     # mode 1 = segment
+            c = m.condition(a_leaf, P_sg, mode=1,                     # mode 1 = segment
+                            local=self.cond_local(subject.sub, P_sg))
             mu, logvar = m.encode_streamlines(S_sg, c)
             rec = m.decode(m.reparameterize(mu, logvar), c)
             l_sr = L.stream_recon_loss(rec, S_sg)

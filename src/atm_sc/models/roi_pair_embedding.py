@@ -27,7 +27,8 @@ def canonical_pairs(pairs: torch.Tensor) -> torch.Tensor:
 
 class ROIPairEmbedding(nn.Module):
     def __init__(self, n_roi: int, emb_dim: int = 64, cond_dim: int = 512, hidden: int = 256,
-                 latent_dim: int = 64, n_modes: int = 2, prior_use_anatomy: bool = False):
+                 latent_dim: int = 64, n_modes: int = 2, prior_use_anatomy: bool = False,
+                 local_dim: int = 0):
         super().__init__()
         self.n_roi, self.emb_dim, self.cond_dim = n_roi, emb_dim, cond_dim
         self.emb = nn.Embedding(n_roi, emb_dim)
@@ -50,6 +51,18 @@ class ROIPairEmbedding(nn.Module):
         nn.init.zeros_(self.anatomy_norm.bias)
         # 학습 가능한 스칼라 gain. LN 뒤라 이제 "pair 대비 몇 배로 들을지" 만 조절한다.
         self.anatomy_gain = nn.Parameter(torch.ones(1))
+        # pair 별 **국소** anatomy (전략 문서 §3.2). 전역 anatomy 는 subject 성분이 2.1% 뿐인데
+        # (subject 간 코사인 0.9994) ROI 국소 pooling 은 13.4% 다 -- global average pooling 이
+        # 개인차를 지운 뒤의 벡터만 조건으로 들어가고 있었다. count head 쪽에서 이 입력을 주자
+        # 잔차 상관이 0.001 -> 0.034 로, self-shuffled 격차가 -0.005 -> +0.031 로 바뀌었다
+        # (outputs/eval/a2_residual_trace_D{,_local}.jsonl). 여기는 그 입력을 **디코더 조건**에도
+        # 넣는 통로다. 0-init 이라 켜도 시작 cond 는 bit-exact 하다.
+        self.local_dim = int(local_dim)
+        self.local_proj = None
+        if self.local_dim:
+            self.local_proj = nn.Sequential(nn.Linear(self.local_dim, hidden), nn.GELU(),
+                                            nn.Linear(hidden, cond_dim))
+            nn.init.zeros_(self.local_proj[-1].weight); nn.init.zeros_(self.local_proj[-1].bias)
         # 조건부 prior p(z | pair) = N(mu_pair, I). pair 정보가 z 공간에 직접 들어간다.
         # 근거: 같은 decoder 라도 z 를 GT posterior 은행에서 뽑으면 pair 정확도 0.66, N(0,I) 면 0.
         # 즉 decoder 는 z 에 실린 pair 정보를 듣는다. 0-init -> 시작은 N(0,I).
@@ -145,11 +158,20 @@ class ROIPairEmbedding(nn.Module):
         """cond 에 들어가는 anatomy 항. LayerNorm 으로 pair 항과 크기를 대등하게 맞춘다."""
         return self.anatomy_gain * self.anatomy_norm(anatomy)
 
-    def forward(self, anatomy: torch.Tensor, pairs: torch.Tensor, mode=0) -> torch.Tensor:
-        """anatomy [1,C] 또는 [N,C], pairs [N,2] -> cond [N,C]. mode: 0 full / 1 segment."""
+    def forward(self, anatomy: torch.Tensor, pairs: torch.Tensor, mode=0,
+                local: torch.Tensor | None = None) -> torch.Tensor:
+        """anatomy [1,C] 또는 [N,C], pairs [N,2] -> cond [N,C]. mode: 0 full / 1 segment.
+        local [N, local_dim] 은 local_dim > 0 일 때 pair 별 국소 anatomy."""
         n = pairs.shape[0]
         if anatomy.shape[0] == 1:
             anatomy = anatomy.expand(n, -1)
         assert anatomy.shape == (n, self.cond_dim), (anatomy.shape, n, self.cond_dim)
         m = self._mode_idx(mode, n, pairs.device)
-        return self.anatomy_term(anatomy) + self.proj(self.pair_vec(pairs)) + self.mode_emb(m)
+        c = self.anatomy_term(anatomy) + self.proj(self.pair_vec(pairs)) + self.mode_emb(m)
+        if self.local_proj is not None:
+            assert local is not None, "local_dim > 0 인데 local feature 가 안 넘어왔다"
+            assert local.shape == (n, self.local_dim), (local.shape, n, self.local_dim)
+            c = c + self.local_proj(local)
+        else:
+            assert local is None, "local_dim = 0 인데 local feature 가 넘어왔다"
+        return c

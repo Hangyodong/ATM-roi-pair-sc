@@ -85,6 +85,7 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
     kw.setdefault("use_refiner", bool(sd.get("use_refiner", False)))
     kw.setdefault("prior_use_anatomy", bool(sd.get("prior_use_anatomy", False)))
     kw.setdefault("count_local_dim", int(sd.get("count_local_dim", 0)))
+    kw.setdefault("cond_local_dim", int(sd.get("cond_local_dim", 0)))
     if sd.get("refiner"):
         kw.setdefault("refiner", sd["refiner"])
     m = ROIPairATM(n_roi=n_roi, trainable="full" if lv == "full" else "vae", unet_level=lv,
@@ -102,7 +103,7 @@ class ROIPairATM(nn.Module):
                  trainable: str = "vae", device="cuda", models_dir=None, unet_level: str | None = None,
                  in_channels: int = 2, template=None, use_refiner: bool = False,
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
-                 count_local_dim: int = 0):
+                 count_local_dim: int = 0, cond_local_dim: int = 0):
         """trainable: 'decoder' | 'vae' | 'vae+unet4' | 'full'.
         unet_level: 'none' | 'stage4' | 'stage3' | 'stage2' | 'full'. 주면 trainable 의 UNet 부분을 덮어쓴다.
         'full' = VAE 인코더/디코더 + UNet 전체 + heads (최종 전략 §2).
@@ -128,7 +129,8 @@ class ROIPairATM(nn.Module):
         self.atm.set_unet_trainable(unet_level)
         self.unet_level = unet_level
         self.pair_emb = ROIPairEmbedding(n_roi, emb_dim, ANATOMICAL_DIM, latent_dim=LATENT_DIM,
-                                         prior_use_anatomy=prior_use_anatomy).to(self.device)
+                                         prior_use_anatomy=prior_use_anatomy,
+                                         local_dim=int(cond_local_dim)).to(self.device)
         self.weight_head = StreamlineWeightHead(ANATOMICAL_DIM, LATENT_DIM).to(self.device) \
             if use_weight_head else None
         # 그룹 템플릿 인수분해 (재학습 설계 §2 ③): head 는 템플릿 위의 **개인차만** 학습한다.
@@ -288,9 +290,11 @@ class ROIPairATM(nn.Module):
     def encode_anatomy(self, t1_w: torch.Tensor) -> torch.Tensor:
         return self.atm.encode_anatomy(t1_w)
 
-    def condition(self, anatomy: torch.Tensor, pairs: torch.Tensor, mode=0) -> torch.Tensor:
-        """mode 0 = full streamline, 1 = SC edge-aligned segment (같은 decoder, 조건만 다름)."""
-        return self.pair_emb(anatomy, canonical_pairs(pairs), mode)
+    def condition(self, anatomy: torch.Tensor, pairs: torch.Tensor, mode=0,
+                  local: torch.Tensor | None = None) -> torch.Tensor:
+        """mode 0 = full streamline, 1 = SC edge-aligned segment (같은 decoder, 조건만 다름).
+        local [N, D] 은 pair_emb 이 local_dim > 0 으로 만들어졌을 때만 준다."""
+        return self.pair_emb(anatomy, canonical_pairs(pairs), mode, local)
 
     def decode(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         mm = self.atm.decode_mm(z, cond)
@@ -376,12 +380,16 @@ class ROIPairATM(nn.Module):
                                           generator=generator)
 
     def generate(self, anatomy: torch.Tensor, pairs: torch.Tensor, n_per_pair: int,
-                 chunk: int = 8192, generator=None, amp_dtype=None, z=None):
+                 chunk: int = 8192, generator=None, amp_dtype=None, z=None,
+                 local_roi: torch.Tensor | None = None):
         """pairs [K,2] 각각에 대해 n_per_pair 개. -> (mm [K*n,128,3], w [K*n], pairs_rep [K*n,2]).
 
         inference 전용 (grad 없음). anatomy 는 이미 계산된 것을 재사용한다.
         z 를 주면 사전분포 대신 그것을 쓴다 (inference.latent_bank).
+        local_roi [R, D] 는 pair_emb.local_dim > 0 일 때 필요하다 (subject 의 ROI 국소 anatomy).
         """
+        assert not (self.pair_emb.local_dim and local_roi is None), (
+            "cond 국소 통로가 켜져 있는데 local_roi 가 안 넘어왔다")
         with torch.inference_mode():
             pr = canonical_pairs(pairs).repeat_interleave(n_per_pair, dim=0)
             if z is None:
@@ -391,7 +399,12 @@ class ROIPairATM(nn.Module):
                 z = torch.as_tensor(z, device=self.device, dtype=torch.float32)
             outs, ws = [], []
             for i in range(0, pr.shape[0], chunk):
-                c = self.condition(anatomy, pr[i:i + chunk])
+                pc = pr[i:i + chunk]
+                lc = None
+                if self.pair_emb.local_dim:
+                    from ..data.local_feats import pair_local
+                    lc = pair_local(local_roi, canonical_pairs(pc))
+                c = self.condition(anatomy, pc, local=lc)
                 if amp_dtype is None:
                     mm = self.decode(z[i:i + chunk], c)
                 else:
