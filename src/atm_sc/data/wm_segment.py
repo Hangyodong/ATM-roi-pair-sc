@@ -53,8 +53,10 @@ def brain_mask_W(erode_mm: int = 4) -> np.ndarray:
 
 
 def wm_probability(t1_W: np.ndarray, mask: np.ndarray | None = None,
-                   mrf: float = 0.2, iters: int = 5) -> np.ndarray:
+                   mrf: float = 0.2, iters: int = 5, return_all: bool = False):
     """W 격자 T1 -> WM 확률 [193,229,193] float32 (0~1).
+
+    return_all=True 면 {"wm","gm","csf","brain"} dict 를 준다 (brain 은 subject 뇌 마스크 bool).
 
     Atropos 를 k-means(3) 로 초기화하고, 클래스 평균 강도가 가장 높은 것을 WM 으로 본다
     (T1 에서 WM > GM > CSF). 클래스 번호를 고정으로 가정하지 않는다.
@@ -90,8 +92,35 @@ def wm_probability(t1_W: np.ndarray, mask: np.ndarray | None = None,
     frac = float((wm > 0.5).sum()) / float(mask.sum())
     assert 0.20 < frac < 0.70, f"WM 비율이 이상하다: {frac:.3f} (뇌 안에서 20~70% 여야 함)"
     assert np.isfinite(wm).all() and wm.max() > 0.9, "WM 확률이 비었거나 NaN"
-    return wm
+    if not return_all:
+        return wm
+    # CSF < GM < WM (T1 강도 오름차순). WM 은 위에서 크기 하한까지 걸어 고른 k 를 쓰고,
+    # 나머지 둘은 평균 강도 순으로 가른다. 예전에는 WM 만 저장하고 GM/CSF 를 버렸는데,
+    # ROI 별 GM 부피와 CSF(위축) 는 자로 잰 개인차 feature 라 버릴 이유가 없었다.
+    rest = [c for c in range(N_CLASS) if c != k]
+    csf_i, gm_i = sorted(rest, key=lambda c: means[c])
+    out = {"wm": wm, "gm": probs[gm_i].astype(np.float32), "csf": probs[csf_i].astype(np.float32)}
+    tissue = out["wm"] + out["gm"] + out["csf"]
+    assert float(np.abs(tissue[mask] - 1.0).max()) < 0.05, "3 class 확률 합이 1 이 아니다"
+    # subject 뇌 마스크: 템플릿 침식본이 아니라 이 subject 의 조직이 실제로 있는 곳.
+    # 침식 마스크 밖은 Atropos 가 보지 않았으므로 0 이고, 그래서 침식 마스크와의 AND 가 된다.
+    out["brain"] = ((out["gm"] + out["wm"]) > 0.5) & mask
+    assert out["brain"].sum() > 500_000, f"subject 뇌 마스크가 너무 작다: {int(out['brain'].sum())}"
+    return out
 
 
 def wm_path(cache: Path, sub: str) -> Path:
     return Path(cache) / f"{sub}_WM_W.npy"
+
+
+def tissue_path(cache: Path, sub: str, source: str = "rigid") -> Path:
+    """CSF/GM/WM 확률 + subject 뇌 마스크 (uint8 로 압축 저장, 1/255 단위).
+
+    두 벌이 필요하다.
+      rigid  개인 뇌 형태를 보존한다 -> **feature** 용 (형태 자체가 개인차 신호다)
+      syn    NLin6 로 비선형 정합된다 -> **filtering/trimming** 용. GT 가닥이 QSDR/NLin6 공간에
+             있어서 rigid 조직맵과는 조직 경계가 어긋난다 (측정: GT 점이 GM+WM 안에 들어가는
+             비율 rigid 0.820 / syn 0.907, GT WM 점유 중앙값 0.573 / 0.801).
+    """
+    tag = "" if source == "rigid" else f"_{source}"
+    return Path(cache) / f"{sub}_tissue{tag}_W.npz"

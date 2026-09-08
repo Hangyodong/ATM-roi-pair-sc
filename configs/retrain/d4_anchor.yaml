@@ -36,7 +36,7 @@ unet_level: none
 t1_source: rigid
 in_channels: 2
 template: true
-resume: /scratch/home/wog3597/ATM/outputs/checkpoints/retrain/a3_aux_smoke/a3_aux_step30.pt
+resume: outputs/checkpoints/retrain/df_prior/d3_joint_step2000.pt
 log_every: 50
 save_every: 500
 

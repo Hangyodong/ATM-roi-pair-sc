@@ -25,7 +25,9 @@ def to_mat(v, n_roi):
 
 def main(a):
     z = np.load(a.vectors, allow_pickle=False)
-    subs, G = z["subjects"], z["gt"]
+    gk = a.gt_key if a.gt_key in z.files else ("gt" if "gt" in z.files else "gt_sc")
+    assert a.pred_key in z.files, f"{a.pred_key} 없음. 있는 키: {sorted(z.files)}"
+    subs, G = z["subjects"], z[gk]
     P = z[a.pred_key]
     assert G.shape == P.shape and G.ndim == 2, (G.shape, P.shape)
     n_roi = int(round((1 + np.sqrt(1 + 8 * G.shape[1])) / 2))
@@ -68,7 +70,8 @@ def main(a):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--vectors", required=True, help="outputs/eval/final_<ckpt>_vectors.npz")
-    ap.add_argument("--pred-key", default="pred_best", choices=["pred_best", "pred_generated", "pred_count"])
+    ap.add_argument("--pred-key", default="pred_best")
+    ap.add_argument("--gt-key", default="gt")
     ap.add_argument("--pred-label", default="generated (alloc)")
     ap.add_argument("--per-fig", type=int, default=8)
     sys.exit(main(ap.parse_args()))

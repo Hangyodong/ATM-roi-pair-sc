@@ -46,6 +46,11 @@ class LossWeights:
                                   # 길게 헤매는 쪽으로 도망간다 (실측: 111 mm -> 323 mm, GT 103 mm).
     presence: float = 0.5         # §20-21: pass-edge 존재 여부 BCE (기본 SUB-SUB)
     # EDGE_ALIGNED 전략 §13-22: SC edge 단위 segment 분기 + edge count head
+    # 백질 점유: 생성/복원 가닥이 백질 안을 지나게 한다. 실측(val 3명, SyN 공간): GT 중간구간
+    # WM 점유 중앙 0.988 / 86 %가 0.5 초과, 생성은 0.384 / 36 % 뿐이다. 이 초과 방황이 가닥당
+    # 방문 ROI 를 6.4 (GT 4.4) 로 만들어 배분 개인차의 pass SC 전달률을 0.27 로 떨어뜨린다.
+    wm_gen: float = 0.0           # 생성(prior 표본) 가닥. 0 = 끔
+    wm_rec: float = 0.0           # 복원(GT posterior) 가닥
     seg_recon: float = 1.0
     seg_kl: float = 0.1
     seg_geom: float = 1.0
@@ -132,6 +137,10 @@ class TrainConfig:
     prior_local_rank: int = 0     # >0 이면 prior 국소 가지를 pair 인덱스 저랭크로
     prior_local_center: bool = False  # prior 국소 입력에서 train 평균 ROI feature 를 뺀다
     tier1_stats: str | None = None        # train 전용 표준화 통계 npz (data/anat_tier1.pair_stats)
+    wm_source: str = "syn"        # 백질 안내장 공간. GT 가닥이 QSDR/NLin6 이므로 rigid 를 쓰면
+                                  # 조직 경계가 어긋난다 (GT 점이 GM+WM 안: rigid 0.820 / syn 0.907)
+    wm_target: float = 0.9        # hinge 목표. 넘긴 점은 더 밀지 않는다 (피질에 못 닿는 것을 막는다)
+    wm_interior: float = 0.125    # 양끝에서 뺄 비율 (끝점은 GM 에 닿아야 한다)
     pair_anchor: str | bool | None = None # pair 앵커 재매개화 (models/pair_anchor.py). 경로 또는 True
     anchor_alpha: float = 0.0             # 0 = 전역 박스(기존과 bit-exact), 1 = 완전 앵커
     anchor_alpha_steps: int = 0           # >0 이면 alpha 를 0 -> anchor_alpha_end 로 선형 램프업.
@@ -221,6 +230,7 @@ class Trainer:
         self._o3_leaf = self._roi_cache = None
         # prior 잔차 적합용 pair 별 posterior mu EMA. train 중 본 subject 들의 평균 -> 이걸 빼야
         # 남는 것이 subject 잔차다. 시작값은 prior_mean(pair) 라 초기 잔차가 0 이다 (편향 없음).
+        self._wm = {}                 # {sub: (guide, wm)} -- 34 MB x 2, 한 subject 만 들고 있는다
         self._mu_bar = None
         if self.w.prior_res > 0 or self.w.prior_res_corr > 0:
             n_roi_ = int(model.n_roi); iu_ = np.stack(np.triu_indices(n_roi_, 1), 1)
@@ -418,6 +428,43 @@ class Trainer:
             return None
         return self._tier1_all(sub)
 
+    def wm_fields(self, sub: str):
+        """(guide, wm) [X,Y,Z]. guide 는 거리 램프라 백질 밖에서도 기울기가 산다.
+
+        원 WM 확률로 손실을 걸면 백질에서 떨어진 가닥의 기울기가 정확히 0 이다 (합성 검증:
+        손실 0.90, 기울기 노름 0.0). wm 은 보고용 실제 점유율 계산에만 쓴다.
+        """
+        # subject 는 step 마다 바뀌므로(라운드로빈) GPU 캐시 1개는 매 step 디스크를 다시 읽는다
+        # -- 실측 step 0.40s -> 4.64s. uint8 그대로 **RAM 에** 전부 들고(144명 x 2 x 8.5 MB = 2.4 GB)
+        # step 마다 GPU 로 올린다 (17 MB, ~2 ms).
+        if sub not in self._wm:
+            import numpy as _np
+            from ..data.wm_guide import guide_path as _gp, load as _guide
+            from ..data.wm_segment import tissue_path as _tp
+            from ..data.paths import CACHE as _C
+            src = self.cfg.wm_source
+            if not _gp(sub, src).exists():
+                _guide(sub, src)                       # 없으면 만들어 캐시 (거리 변환 ~1.5s)
+            g8 = torch.from_numpy(_np.load(_gp(sub, src)))
+            w8 = torch.from_numpy(_np.load(_tp(_C, sub, src))["wm"])
+            assert g8.shape == w8.shape and g8.dtype == torch.uint8, (g8.shape, w8.shape, g8.dtype)
+            self._wm[sub] = (g8.pin_memory(), w8.pin_memory())
+        # chunk 루프에서 step 당 여러 번 불린다. float 변환(34 MB x 2)을 그때마다 하면
+        # step 0.40s -> 4.3s 가 된다 -> subject 가 바뀔 때만 변환해 GPU 에 하나 들고 있는다.
+        if getattr(self, "_wm_gpu", (None,))[0] != sub:
+            g8, w8 = self._wm[sub]
+            to = lambda t: t.to(self.device, non_blocking=True).float().div_(255.0)
+            self._wm_gpu = (sub, to(g8), to(w8))
+        return self._wm_gpu[1], self._wm_gpu[2]
+
+    def wm_inv_affine(self):
+        if getattr(self, "_wm_inv", None) is None:
+            import numpy as _np
+            from ..spaces import W_AFFINE
+            self._wm_inv = torch.as_tensor(_np.linalg.inv(W_AFFINE), dtype=torch.float32,
+                                           device=self.device)
+        return self._wm_inv
+
     def local_feat(self, sub: str) -> torch.Tensor | None:
         """subject 의 ROI 국소 anatomy [R, D]. count_local_dim = 0 이면 None."""
         if not self.cfg.count_local_dim:
@@ -482,7 +529,7 @@ class Trainer:
 
         # [G] ------------------------------------------------------------------------
         gen_needed = bool(active & {"endpoint", "corr", "mag", "length", "presence"}) or \
-            ("route" in active and w.route_gen > 0)
+            ("route" in active and w.route_gen > 0) or w.wm_gen > 0
         sc_active = bool(active & {"corr", "mag", "length", "presence", "scale", "rmse"})
         pid_all = np.asarray(subject.pair_ids, np.int64)
         sel = np.arange(len(pid_all))
@@ -572,6 +619,7 @@ class Trainer:
             out["sc_pred_sum"] = float(acc.sc.sum())
 
         l_end_tot, hits, seen, w_vals, l_route_gen, l_genlen, gen_len_mm = 0.0, 0.0, 0, [], 0.0, 0.0, 0.0
+        l_wm_gen, wm_occ_gen = 0.0, 0.0
         gt_len_pair = (torch.as_tensor(np.asarray(subject.len_end, np.float32), device=self.device)[
             torch.as_tensor(pos[:, 0], device=self.device), torch.as_tensor(pos[:, 1], device=self.device)]
             .repeat_interleave(cfg.n_gen_per_pair, 0) if gen_needed else None)
@@ -602,6 +650,14 @@ class Trainer:
                 v = L.route_loss(lu, marg[i:i + cfg.chunk], cfg.route_mode, cfg.route_pos_weight)
                 l_route_gen += float(v) * frac
                 total_c = total_c + w.route_gen * v * frac
+            if w.wm_gen > 0:
+                gd, wv = self.wm_fields(subject.sub)
+                v = L.wm_occupancy_loss(S, gd, self.wm_inv_affine(),
+                                        interior=cfg.wm_interior, target=cfg.wm_target)
+                l_wm_gen += float(v) * frac
+                total_c = total_c + w.wm_gen * v * frac
+                with torch.no_grad():   # 보고는 안내장이 아니라 **실제 WM 확률** 로 한다
+                    wm_occ_gen += _wm_occ(S.detach(), wv, self.wm_inv_affine(), cfg.wm_interior) * frac
             if sc_active:
                 sc_c, num_c = self.builder(S, streamline_lengths(S), wk)
                 total_c = total_c + (sc_c * G_sc).sum() + (num_c * G_num).sum()
@@ -613,6 +669,8 @@ class Trainer:
             out["L_route_gen"] = l_route_gen
         if gen_needed and w.gen_length > 0:
             out["L_gen_length"] = l_genlen; out["gen_length_mm"] = gen_len_mm
+        if w.wm_gen > 0:
+            out["L_wm_gen"] = l_wm_gen; out["wm_occ_gen"] = wm_occ_gen
         if sc_active and "presence" in active:
             out.update({f"gen_{k}": v for k, v in L.presence_metrics(acc.sc, gt_w, self.presence_mask).items()})
         if w_vals:
@@ -661,6 +719,15 @@ class Trainer:
             l_kl = L.kl_loss(mu, logvar, mu_p.detach(), 2.0 * ls_p.detach())
             l_geom = L.adjacency_loss(rec)
             tot_r = w.recon * l_rec + w.kl * l_kl + w.geom * l_geom
+            if w.wm_rec > 0:
+                gd, wv = self.wm_fields(subject.sub)
+                l_wmr = L.wm_occupancy_loss(rec, gd, self.wm_inv_affine(),
+                                            interior=cfg.wm_interior, target=cfg.wm_target)
+                tot_r = tot_r + w.wm_rec * l_wmr
+                out["L_wm_rec"] = float(l_wmr)
+                with torch.no_grad():
+                    out["wm_occ_rec"] = _wm_occ(rec.detach(), wv, self.wm_inv_affine(), cfg.wm_interior)
+                    out["wm_occ_gt"] = _wm_occ(S_gt, wv, self.wm_inv_affine(), cfg.wm_interior)
             if w.prior > 0:
                 l_prior = -prior_log_prob(mu.detach(), mu_p, ls_p).mean()
                 tot_r = tot_r + w.prior * l_prior
@@ -881,3 +948,16 @@ class Trainer:
             if p.grad is not None:
                 s += float(p.grad.norm()) ** 2
         return s ** 0.5
+
+
+def _wm_occ(mm: torch.Tensor, wm: torch.Tensor, inv_affine: torch.Tensor,
+            interior: float = 0.125) -> float:
+    """보고용 실제 백질 점유율 (중간구간 평균). 손실은 안내장으로 걸지만 지표는 원 확률로 낸다."""
+    import torch.nn.functional as F
+    N, T = mm.shape[:2]
+    lo = int(T * interior); x = mm[:, lo:T - lo]
+    ijk = torch.einsum("ij,ntj->nti", inv_affine[:3, :3].to(x.dtype), x) + inv_affine[:3, 3].to(x.dtype)
+    size = torch.tensor(wm.shape, device=x.device, dtype=x.dtype)
+    g = (2.0 * ijk / (size - 1.0) - 1.0).flip(-1)
+    return float(F.grid_sample(wm[None, None].to(x.dtype), g.reshape(1, 1, 1, -1, 3),
+                               align_corners=True, padding_mode="zeros").mean())

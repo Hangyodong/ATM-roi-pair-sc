@@ -413,7 +413,7 @@ def main(a):
         a.tier1_stats = {k: z1[k] for k in z1.files}
         tr = [l.strip() for l in (ROOT / "outputs/splits/train.txt").read_text().splitlines() if l.strip()]
         assert list(z1["subjects"]) == tr, "tier1 통계가 train split 으로 만들어지지 않았다 (누수)"
-    if a.use_bank:
+    if getattr(a, "use_bank", False):   # 폐기됨: 추론에 train latent bank 를 쓰는 경로 (그룹 정보)
         bp, tp = ROOT / "outputs/inference/latent_bank.npz", ROOT / "outputs/inference/template.npz"
         assert bp.exists() and tp.exists(), "scripts/34_build_inference_prior.py 를 먼저 실행"
         a.bank = LatentBank.load(bp)
@@ -571,8 +571,6 @@ if __name__ == "__main__":
                     help="pair count head 의 subject 잔차로 가닥 배분을 변조한다. 끝점 head 는 "
                          "잔차 목적으로 학습된 적이 없어 그 개인차는 잡음이다")
     ap.add_argument("--resid-gain", type=float, default=1.0)
-    ap.add_argument("--use-bank", action="store_true",
-                    help="배분=train 템플릿, latent=train bank (재학습 없이 SC r 0.71 -> 0.88). --by-count 와 같이 쓴다")
     ap.add_argument("--by-count", action="store_true",
                     help="pair 마다 예측 개수만큼 생성 (GT 밀도 재현). 생성 개수가 곧 SC 값")
     ap.add_argument("--total-streamlines", type=int, default=0,

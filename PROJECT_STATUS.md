@@ -112,3 +112,16 @@ MRtrix/FreeSurfer/MATLAB/DSI Studio/singularity 없음 (불필요). `/mnt/d` 의
   - `docs/PIPELINE_12_PROBLEM_SUMMARY.md` — 남은 문제, 실험 원장, 기준선 대조표, 확정/미확정 구분.
 - **문제 목록**: `docs/PIPELINE_09_PROBLEM_INVENTORY.md` — 단계별 문제를 축 A(개인차)/B(기하)/C(지표·절차) 로 재정리. 순서 제약: A3 공간 대응 → A1 pooling → A2 조건 주입. C1·C2 는 코드 수정 없이 즉시 수정 가능.
 - **해결 계획**: `docs/PIPELINE_10_RESOLUTION_PLAN.md` — S0 계측 고정 → S1 공간 결정 실험(전체 게이트) → S2 ROI 국소 조건화 → S3 파일럿 → 분기. GPU 1장이라 GPU 구간은 직렬(lock), 나머지만 병렬.
+
+## E/D 재설계 (2026-09-07) — `docs/PIPELINE_13_CHANGE_LOG.md` §9
+- 병목은 feature 가 아니라 **풀링과 공유 가중치**였다. ROI 국소 풀링 + 티어1 pair 별 가중치(ridge 동형)로
+  count head `resid_r` 0.034 → **0.074**, 식별 0.065 → **0.258** (8× chance, p=0.00), 전부 val.
+- 생성 경로는 아직 그대로다: `inter_subj_generated` 0.9986, edge 선택 Jaccard 0.9896, prior subject 성분 0.0005.
+  이걸 고치는 것이 D-f''(prior 잔차 손실) → A3(edge/count_end 통로) → D4 → J1 → A/B → test 1회.
+- `inter_subj_r` 은 진폭 지표다: gain 8 이면 GT 수준(0.89)이 되지만 `resid_r` 은 0.030 → 0.016. 진폭과 정확도를 항상 같이 보고.
+- 결정: E9(full UNet) 드롭 (+5.9% 파라미터, OOM). test 는 최종 1회만. 구조는 config 가 아니라 resume checkpoint 에서 상속.
+
+## test 1회 결과 (2026-09-08 01:39, 31명) — `docs/PIPELINE_13_CHANGE_LOG.md` M24
+- 최종 checkpoint `outputs/checkpoints/retrain/j1_joint_noanchor/d3_joint_step1000.pt` (E8 → D-f''' → A3 → J1 no-anchor; D4 앵커 폐기).
+- alloc 경로: r 0.576, resid_r −0.016, inter_subj 0.9715 (GT 0.896). count head: resid_r 0.084. 템플릿 0.945, 0/31.
+- 결론: 개인차 정보는 count head 에 있고(val·test 일관) 생성 경로로 전달되지 않는다. test 는 이제 소진됐다 — 다음 판정은 새 split 이나 val 로만.

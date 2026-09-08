@@ -108,7 +108,7 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
 class ROIPairATM(nn.Module):
     def __init__(self, n_roi: int = 82, init_bundle: str = "AF_L",
                  coord_min=None, coord_max=None, t1_norm: BundleNorm | None = None,
-                 emb_dim: int = 64, use_weight_head: bool = True, use_edge_head: bool = True,
+                 emb_dim: int = 64, use_weight_head: bool = False, use_edge_head: bool = True,
                  trainable: str = "vae", device="cuda", models_dir=None, unet_level: str | None = None,
                  in_channels: int = 2, template=None, use_refiner: bool = False,
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
@@ -222,10 +222,26 @@ class ROIPairATM(nn.Module):
               "(구 1채널 checkpoint). 입력 프로토콜이 다르면 결과가 달라진다.", flush=True)
         return sd
 
+    @staticmethod
+    def _drop_dead_keys(sd: dict, have_weight_head: bool) -> dict:
+        """더 이상 만들지 않는 모듈의 checkpoint 키를 버린다.
+
+        weight_head 는 by-count 배분(생성 가닥 수 자체가 SC)에서 구조적으로 불필요하고, 이 프로젝트의
+        어느 phase 도 학습시킨 적이 없다 (마지막 층 가중치가 정확히 0 -> w = 1.0 상수). 213,761 개
+        파라미터를 옵티마이저와 checkpoint 에 계속 싣고 있었다. 옛 checkpoint 는 이 키를 갖고 있으므로
+        모델에 그 모듈이 없으면 조용히 버린다 (없으면 "checkpoint 에만 있는 키" assert 로 죽는다)."""
+        if have_weight_head:
+            return sd
+        drop = [k for k in sd if k.startswith("weight_head.")]
+        if drop:
+            print(f"[load] weight_head 키 {len(drop)}개 버림 (by-count 배분에서 불필요)", flush=True)
+        return {k: v for k, v in sd.items() if not k.startswith("weight_head.")}
+
     def load_checkpoint(self, sd: dict, strict: bool = False) -> dict:
         """checkpoint 이어받기. strict=False 면 **이 모델에만 있는 새 모듈**(나중에 추가한 head)은
         초기값을 유지하고 나머지는 그대로 싣는다. checkpoint 에만 있는 키가 있으면 구조가 바뀐 것이므로 중단한다."""
         sd = self._pad_conv1_in_channels(sd)
+        sd = self._drop_dead_keys(sd, self.weight_head is not None)
         missing, unexpected = self.load_state_dict(sd, strict=False)
         assert not unexpected, f"checkpoint 에만 있는 키 (구조 불일치): {unexpected[:8]}"
         if missing:

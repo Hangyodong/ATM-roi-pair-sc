@@ -182,11 +182,16 @@ def template_counts(template_end: np.ndarray, pairs: np.ndarray, total: int,
 
 @torch.no_grad()
 def generate_by_count(model, anatomy, pairs: np.ndarray, counts: np.ndarray, atlas, affine, n_roi: int,
-                      batch: int = 20000, seed: int = 0, keep: bool = False, bank=None, local_roi=None):
+                      batch: int = 20000, seed: int = 0, keep: bool = False, bank=None, local_roi=None,
+                      trim=None):
     """pair 별 counts 만큼 생성하고 SC 를 누적한다 (전부 메모리에 올리지 않는다).
 
     bank (inference.latent_bank.LatentBank) 를 주면 사전분포 대신 거기서 latent 를 뽑는다.
     bank 에 없는 pair 만 N(mu_pair, I) 로 채운다.
+
+    trim = (wm, brain, TrimConfig) 를 주면 SC 누적 **직전**에 백질 경계 trimming +
+    subject 뇌 마스크 filtering 을 건다 (상류 ATM 의 Filtered/Trimmed bundle). wm/brain 은
+    가닥과 **같은 공간**(SyN/NLin6)이어야 한다. 자른 뒤 길이가 가변이라 hard_sc 에 npts 로 넘긴다.
     -> (sc dict {pass,end} x {sc,sc_w,len}, n_total, streamlines | None)
     """
     from ..data.tt_io import hard_sc
@@ -197,7 +202,7 @@ def generate_by_count(model, anatomy, pairs: np.ndarray, counts: np.ndarray, atl
     kept = []
     g = torch.Generator(device=model.device); g.manual_seed(seed)
     rs = np.random.default_rng(seed)
-    n_hit = 0
+    n_hit = n_drop = 0
     for i in range(0, len(rep), batch):
         blk = rep[i:i + batch]
         P = torch.as_tensor(blk, device=model.device)
@@ -211,9 +216,21 @@ def generate_by_count(model, anatomy, pairs: np.ndarray, counts: np.ndarray, atl
                                 torch.as_tensor(zb, device=model.device), z)
         S, w, _ = model.generate(anatomy, P, 1, generator=g, z=z, local_roi=local_roi)
         S = S.cpu().numpy().astype(np.float32)
-        npts = np.full(len(S), S.shape[1], np.int64)
+        if trim is None:
+            pts = S.reshape(-1, 3); npts = np.full(len(S), S.shape[1], np.int64)
+        else:
+            from ..filtering.wm_trim import trim_and_filter
+            from ..spaces import W_AFFINE, W_SHAPE
+            wm_v, brain_v, tcfg = trim
+            # **아틀라스 affine 을 쓰면 안 된다.** 아틀라스는 2 mm 격자(91,109,91)이고 조직맵은
+            # 1 mm W 격자(193,229,193)라 서로 다른 위치를 가리킨다 -- 값은 그럴듯하게 나오고 결과만 틀린다.
+            assert tuple(wm_v.shape) == tuple(W_SHAPE), (wm_v.shape, W_SHAPE)
+            pts, npts, keep_m = trim_and_filter(S, wm_v, brain_v, np.asarray(W_AFFINE), tcfg)
+            n_drop += int((~keep_m).sum())
+            if len(npts) == 0:
+                continue
         for mode in ("pass", "end"):
-            w_, s_ = hard_sc(S.reshape(-1, 3), npts, atlas, affine, n_roi, mode)
+            w_, s_ = hard_sc(np.asarray(pts, np.float64), npts, atlas, affine, n_roi, mode)
             W[mode] += w_; S_sum[mode] += s_
         if keep:
             kept.append(S)
@@ -223,4 +240,6 @@ def generate_by_count(model, anatomy, pairs: np.ndarray, counts: np.ndarray, atl
         out[mode] = {"sc": W[mode], "sc_w": W[mode].copy(), "len": L}     # 개수 자체가 SC (weight head 불필요)
     if bank is not None:
         out["bank_hit"] = n_hit / len(rep)
+    if trim is not None:
+        out["trim_drop"] = n_drop / len(rep)
     return out, int(len(rep)), (np.concatenate(kept) if keep else None)

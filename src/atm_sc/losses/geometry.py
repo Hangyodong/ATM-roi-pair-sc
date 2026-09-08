@@ -60,3 +60,33 @@ def kl_loss(mu: torch.Tensor, logvar: torch.Tensor, mu_prior: torch.Tensor | Non
         return (-0.5 * (1 + logvar - d.pow(2) - logvar.exp()).sum(1)).mean()
     return (0.5 * (logvar_prior - logvar + (logvar - logvar_prior).exp()
                    + d.pow(2) * (-logvar_prior).exp() - 1.0).sum(1)).mean()
+
+
+def wm_occupancy_loss(mm: torch.Tensor, wm: torch.Tensor, inv_affine: torch.Tensor,
+                      interior: float = 0.125, target: float = 0.9) -> torch.Tensor:
+    """생성/복원 streamline 이 백질 안을 지나게 하는 손실 (미분 가능).
+
+    측정(val 3명, SyN 공간): GT 가닥은 중간구간 WM 점유 평균 0.825 / 중앙 0.988 이고 86 %가
+    0.5 를 넘는데, 생성 가닥은 평균 0.393 / 중앙 0.384 로 36 %만 넘는다. 디코더가 백질 밖을
+    헤매고, 그래서 가닥 하나가 ROI 를 6.4개(GT 4.4) 지나 pair 20개에 count 를 더한다. 그 희석이
+    배분에 실린 개인차를 pass SC 로 전달하는 비율을 0.27 까지 떨어뜨린다.
+
+    양끝 `interior` 비율은 뺀다 -- 끝점은 피질(GM)에 닿아야 하므로 WM 을 요구하면 안 된다.
+    hinge 라 target 을 넘긴 점은 더 밀지 않는다 (백질 중심으로 뭉쳐 피질에 못 닿는 것을 막는다).
+
+    mm [N,T,3] (W 격자 mm), wm [X,Y,Z] (0~1, streamline 과 **같은 공간**이어야 한다 -- GT 는
+    QSDR/NLin6 이므로 rigid 조직맵을 쓰면 조직 경계가 어긋난다), inv_affine [4,4] mm->voxel.
+    """
+    import torch.nn.functional as F
+    assert mm.ndim == 3 and mm.shape[2] == 3, mm.shape
+    assert wm.ndim == 3, wm.shape
+    N, T = mm.shape[:2]
+    lo = int(T * interior); hi = T - lo
+    assert hi > lo, (T, interior)
+    x = mm[:, lo:hi]
+    ijk = torch.einsum("ij,ntj->nti", inv_affine[:3, :3].to(x.dtype), x) + inv_affine[:3, 3].to(x.dtype)
+    size = torch.tensor(wm.shape, device=x.device, dtype=x.dtype)
+    g = (2.0 * ijk / (size - 1.0) - 1.0).flip(-1)          # grid_sample 은 (x,y,z) = (k,j,i) 순서
+    occ = F.grid_sample(wm[None, None].to(x.dtype), g.reshape(1, 1, 1, -1, 3),
+                        align_corners=True, padding_mode="zeros").reshape(N, hi - lo)
+    return torch.relu(target - occ).mean()
