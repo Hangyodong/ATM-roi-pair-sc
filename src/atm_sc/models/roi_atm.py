@@ -86,6 +86,9 @@ def from_checkpoint(path, device="cuda", n_roi: int = 82, **kw):
     kw.setdefault("prior_use_anatomy", bool(sd.get("prior_use_anatomy", False)))
     kw.setdefault("count_local_dim", int(sd.get("count_local_dim", 0)))
     kw.setdefault("cond_local_dim", int(sd.get("cond_local_dim", 0)))
+    # 이걸 빼면 추론이 gain 없는 조건 벡터를 만든다 -- 학습과 다른 입력이라 조용히 틀린다
+    kw.setdefault("cond_local_gain", float(sd.get("cond_local_gain", 0.0)))
+    kw.setdefault("prior_mu_table", bool(sd.get("prior_mu_table", False)))
     kw.setdefault("count_tier1_dim", int(sd.get("count_tier1_dim", 0)))
     kw.setdefault("count_tier1_pair", bool(sd.get("count_tier1_pair", False)))
     kw.setdefault("aux_local_dim", int(sd.get("aux_local_dim", 0)))
@@ -109,6 +112,7 @@ class ROIPairATM(nn.Module):
     def __init__(self, n_roi: int = 82, init_bundle: str = "AF_L",
                  coord_min=None, coord_max=None, t1_norm: BundleNorm | None = None,
                  emb_dim: int = 64, use_weight_head: bool = False, use_edge_head: bool = True,
+                 cond_local_gain: float = 0.0, prior_mu_table: bool = False,
                  trainable: str = "vae", device="cuda", models_dir=None, unet_level: str | None = None,
                  in_channels: int = 2, template=None, use_refiner: bool = False,
                  refiner: dict | None = None, prior_use_anatomy: bool = False,
@@ -144,6 +148,8 @@ class ROIPairATM(nn.Module):
         self.pair_emb = ROIPairEmbedding(n_roi, emb_dim, ANATOMICAL_DIM, latent_dim=LATENT_DIM,
                                          prior_use_anatomy=prior_use_anatomy,
                                          local_dim=int(cond_local_dim),
+                                         local_gain=float(cond_local_gain),
+                                         prior_mu_table=bool(prior_mu_table),
                                          prior_local_dim=int(prior_local_dim),
                                        prior_local_rank=int(prior_local_rank),
                                        prior_local_n_roi=(n_roi if prior_local_rank else 0)).to(self.device)

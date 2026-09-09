@@ -1,0 +1,100 @@
+# E2 prior 정렬 — pair 별 자유 평균표로 prior 를 posterior 에 맞춘다 (E1 위에)
+#
+# 문제 (실측, val 12명 x 256 pair)
+# --------------------------------
+#   T1 볼륨 (rigid)          subject 간 상관 0.384   개인 성분 7.99 %
+#   WM 확률맵                        0.397           34.37 %
+#   ROI 국소 feature [82,256]        0.912           11.36 %
+#   anatomy 전역 512d                0.9994           1.94 %
+#   **디코더 조건 c**                 0.9996           0.04 %   <- 여기서 죽는다
+#
+# 전처리도 T1 도 멀쩡하다. `condition()` 의 덧셈에서 개인 항이 pair 항에 묻힌 것이다:
+#   c = anatomy_term + proj(pair_vec) + mode_emb + local_proj(local)
+#   항별 RMS: anatomy 0.0307 / pair 0.0334 / **local 0.0014** (24 배 차이)
+# local_proj 는 0-init 이라 학습으로 자라야 하는데 J1 까지 와도 가중치 최대 0.0122 다.
+#
+# 수정: local 항과 pair 항을 각각 RMS 정규화하고 학습 가능한 배율(cond_local_gain)을 곱해
+# 크기를 **구조로** 보장한다. 실측 효과 (재학습 전, 조건 벡터만):
+#   gain 0.3 -> 개인 성분 0.69 %   gain 1.0 -> 4.44 %   gain 3.0 -> 11.14 %
+#
+# 주의: 조건 분포가 바뀌므로 재학습이 필요하다. 켜기만 하면 디코더가 못 보던 입력이 된다.
+phase: d3_joint
+subjects: outputs/splits/train.txt
+max_steps: 1000
+out_dir: outputs/checkpoints/retrain/e2_prior
+trainable: vae
+unet_level: none          # 인코더(E8)는 고정. 22.4M 을 다시 흔들면 그 위 전부가 또 낡는다
+t1_source: rigid
+in_channels: 2
+template: true
+resume: outputs/checkpoints/retrain/e1_full/d3_joint_step1000.pt  # E1 (조건 개인화). 드라이버가 덮어쓴다
+log_every: 50
+save_every: 500
+
+train:
+  bn_mode: eval
+  sc_mode: pass
+  max_pairs_per_step: null
+  chunk: 2048
+  gt_pairs_per_step: 128
+  n_gt_per_pair: 8
+  lr_t1: 0.0
+  lr_vae_enc: 3.0e-06
+  lr_dec: 1.0e-05         # D4 의 1/3
+  lr_heads: 1.0e-04       # A3 의 1/3
+  lr_prior: 1.0e-04       # D-f 의 1/3
+  tier1_lr: 3.0e-04       # pair 별 가중치 (tier1 / prior 저랭크) 의 1/3
+  tier1_wd: 0.1
+  grad_clip: 50.0
+  seed: 0
+  amp: bf16
+  tf32: true
+  cudnn_benchmark: true
+  sc_groups: block
+  resid_beta: 1.0
+  resid_stats: outputs/cache/sc_template_stats.npz
+  tier1_stats: outputs/cache/anat_tier1_pair_stats.npz
+  anchor_alpha: 0.0       # 앵커 없음 (D4 폐기)
+  cond_local_dim: 512
+  cond_local_gain: 1.0    # 드라이버가 E1 승자로 덮어쓴다
+  prior_mu_table: true    # pair 별 자유 prior 평균표 (3321x64). 0-init 이라 켜도 bit-exact
+  prior_table_init: true  # train posterior pair 평균으로 표를 직접 채운다
+                          # 실측: 지금 prior 는 posterior pair 평균 분산을 -0.573 만큼 설명한다
+                          # (상수보다 나쁨). 같은 구조 최선 적합 0.633, 자유 표 1.0
+
+loss:
+  recon: 1.0
+  kl: 0.1
+  geom: 1.0
+  endpoint: 1.0
+  edge: 0.5
+  corr: 0.5
+  mag: 0.5
+  length: 0.2
+  route: 1.0
+  route_gen: 0.5
+  presence: 0.5
+  seg_recon: 1.0
+  seg_kl: 0.1
+  seg_geom: 1.0
+  seg_endpoint: 0.5
+  gen_length: 1.0
+  scale: 1.0
+  rmse: 0.2
+  count: 0.0              # pair 절대 count 손실은 계속 끈다 (템플릿으로 기울기가 샌다)
+  count_end: 1.0
+  res: 1.0
+  res_corr: 0.2
+  diff: 0.2
+  prior: 0.1
+  prior_res: 1.0
+  prior_res_corr: 0.2
+  seg_prior: 0.0
+
+gates:
+  d3_joint:
+  - metric: recon_rmse_eval_mm
+    op: <=
+    value: 4.6             # J1 실측 4.412. 조건이 바뀌어 복원이 무너지면 버린다
+    n_key: n_val
+    min_n: 3

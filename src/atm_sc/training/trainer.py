@@ -127,6 +127,16 @@ class TrainConfig:
     resid_stats: str | None = None        # train split 전용 SC 통계 npz (data/sc_template.py)
     count_local_dim: int = 0              # >0 이면 count head 가 pair 별 ROI 국소 anatomy 를 받는다
     cond_local_dim: int = 0               # >0 이면 **디코더 조건(FiLM)** 도 같은 국소 anatomy 를 받는다
+    prior_mu_table: bool = False          # pair 별 자유 prior 평균표 (3321 x 64). 0-init 이라 켜도 bit-exact.
+                                          # init_prior_template 이 train posterior pair 평균으로 채운다
+    prior_table_init: bool = False        # 템플릿으로 표를 직접 채운다 (학습 없이 설명 몫 -0.573 -> 1.0)
+    cond_local_gain_steps: int = 0        # >0 이면 gain 을 0 -> cond_local_gain 으로 선형 램프업.
+                                          # 한 번에 켜면 디코더가 못 보던 조건 분포가 된다 -- 실측:
+                                          # 300 step 즉시 적용 시 복원 5.09 -> 5.30/6.19, 끝점 0.285 -> 0.25
+    cond_local_gain: float = 0.0          # >0 이면 국소 항 크기를 pair 항 RMS 대비 이 비율로 **구조로** 잡는다.
+                                          # 0-init 에 맡기면 J1 까지 와도 local 항 RMS 0.0014 vs pair 항
+                                          # 0.0334 (24 배 차이) 라 디코더 조건의 개인 성분이 0.04 % 다
+                                          # (T1 볼륨 7.99 %, ROI 국소 feature 11.36 %).
     count_tier1_dim: int = 0              # >0 이면 count head 가 티어 1 해부량(자로 잰 값)을 받는다
     count_tier1_pair: bool = False   # tier1 을 pair 인덱스 가중치로 (ridge 동형)
     aux_local_dim: int = 0            # edge_head / count_head_end 국소 통로
@@ -245,6 +255,9 @@ class Trainer:
         # 원래 메모리를 아끼는 기법인데 여기선 안 아껴서 순수 낭비다.
         model.atm.use_checkpoint = bool(cfg.use_checkpoint)
         if cfg.cond_local_dim:
+            if cfg.cond_local_gain and model.pair_emb.local_gain is None:
+                raise AssertionError("cond_local_gain > 0 인데 모델에 local_gain 이 없다 "
+                                     "(run.py 가 cond_local_gain 을 안 넘겼거나 구조 상속이 빠졌다)")
             assert model.pair_emb.local_dim == cfg.cond_local_dim, (
                 'pair_emb 의 local_dim 이 config 와 다르다', model.pair_emb.local_dim, cfg.cond_local_dim)
         if cfg.count_local_dim:
@@ -378,9 +391,23 @@ class Trainer:
                 n_str += len(pi)
         seen = cnt > 0
         self._mu_bar[seen] = acc[seen] / cnt[seen, None]
-        m.train(was)
         info = {"prior_template_pairs": int(seen.sum()), "prior_template_streamlines": int(n_str),
                 "prior_template_subjects": len(subs), "prior_template_sec": time.time() - t0}
+        if self.cfg.prior_table_init and m.pair_emb.prior_mu_table is not None:
+            # 자유 표를 "template - 현재 prior 평균" 으로 채우면 prior 평균이 곧 template 이 된다.
+            # 실측: 지금 prior 는 posterior pair 평균의 분산을 **-0.573** 만큼 설명한다 (상수보다 나쁘다).
+            # 같은 구조의 최선 적합이 0.633, 자유 표가 1.0 이다. 손실로 수백 step 밀 것을 한 번에 끝낸다.
+            with torch.no_grad():
+                iu_ = torch.triu_indices(int(m.n_roi), int(m.n_roi), 1, device=self.device)
+                Pa = torch.stack([iu_[0], iu_[1]], 1)
+                # 표를 뺀 평균. resume 으로 이미 채워진 표가 있어도 이중 계산이 안 된다.
+                base = m.prior_mean(Pa) - m.pair_emb.prior_table_term(Pa)
+                d = torch.zeros_like(base)
+                d[seen] = self._mu_bar[seen] - base[seen]
+                m.pair_emb.prior_mu_table.weight.copy_(d)
+                info["prior_table_init_rms"] = float(d.pow(2).mean().sqrt())
+                info["prior_table_init_pairs"] = int(seen.sum())
+        m.train(was)
         assert info["prior_template_pairs"] > n_pair // 2, f"템플릿이 채워진 pair 가 너무 적다: {info}"
         print(f"[trainer] prior 잔차 템플릿: {info}", flush=True)
         return info
@@ -494,6 +521,11 @@ class Trainer:
         step 은 pair 앵커 alpha 램프업에만 쓴다 (학습 스케줄)."""
         m, cfg, w = self.model, self.cfg, self.w
         m.train()
+        if cfg.cond_local_gain_steps and getattr(m.pair_emb, "local_gain", None) is not None \
+                and step is not None:
+            f = min(1.0, step / cfg.cond_local_gain_steps)
+            with torch.no_grad():
+                m.pair_emb.local_gain.fill_(f * cfg.cond_local_gain)
         if cfg.anchor_alpha_steps and m.anchor is not None:
             assert step is not None, 'alpha 램프업인데 step 이 안 넘어왔다'
             m.anchor.set_alpha(min(1.0, step / cfg.anchor_alpha_steps) * cfg.anchor_alpha_end)
@@ -503,6 +535,8 @@ class Trainer:
             self._set_ae_bn_eval()
         self.opt.zero_grad(set_to_none=True)
         out, t0 = {}, time.time()
+        if getattr(m.pair_emb, "local_gain", None) is not None:
+            out["cond_local_gain"] = float(m.pair_emb.local_gain)
         active = {("recon" if k == "atm" else k) for k in cfg.active}
 
         # [A] anatomy: 1회 forward, leaf 분리 ------------------------------------------

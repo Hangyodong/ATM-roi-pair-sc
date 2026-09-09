@@ -434,7 +434,8 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
     sd = None
     if resume is not None:
         sd = torch.load(resume, map_location=device, weights_only=False)
-        for k in ("count_local_dim", "cond_local_dim", "count_tier1_dim", "count_tier1_pair",
+        for k in ("count_local_dim", "cond_local_dim", "cond_local_gain", "prior_mu_table",
+                  "count_tier1_dim", "count_tier1_pair",
                   "aux_local_dim", "aux_tier1_dim", "prior_local_dim", "prior_local_rank",
                   "pair_anchor", "prior_use_anatomy"):
             if k in sd and not getattr(cfg, k, None) and sd[k]:
@@ -444,6 +445,8 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                        unet_level=unet_level, in_channels=in_channels, template=template,
                        count_local_dim=int(getattr(cfg, "count_local_dim", 0)),
                        cond_local_dim=int(getattr(cfg, "cond_local_dim", 0)),
+                       cond_local_gain=float(getattr(cfg, "cond_local_gain", 0.0)),
+                       prior_mu_table=bool(getattr(cfg, "prior_mu_table", False)),
                        count_tier1_dim=int(getattr(cfg, "count_tier1_dim", 0)),
                        count_tier1_pair=bool(getattr(cfg, "count_tier1_pair", False)),
                        aux_local_dim=int(getattr(cfg, "aux_local_dim", 0)),
@@ -539,6 +542,9 @@ def run(phase: str, subjects: list[str], max_steps: int, out_dir: Path, cfg: Tra
                     "count_local_dim": (model.count_head.local_dim
                                        if model.count_head is not None else 0),
                     "cond_local_dim": model.pair_emb.local_dim,
+                    "prior_mu_table": bool(model.pair_emb.prior_mu_table is not None),
+                    "cond_local_gain": (float(model.pair_emb.local_gain)
+                                        if model.pair_emb.local_gain is not None else 0.0),
                     "prior_local_dim": model.pair_emb.prior_local_dim,
                     "prior_local_rank": getattr(model.pair_emb, "prior_local_rank", 0),
                     "count_tier1_dim": (model.count_head.tier1_dim

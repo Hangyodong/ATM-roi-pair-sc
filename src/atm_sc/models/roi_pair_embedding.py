@@ -27,6 +27,7 @@ def canonical_pairs(pairs: torch.Tensor) -> torch.Tensor:
 
 class ROIPairEmbedding(nn.Module):
     def __init__(self, n_roi: int, emb_dim: int = 64, cond_dim: int = 512, hidden: int = 256,
+                 local_gain: float = 0.0, prior_mu_table: bool = False,
                  latent_dim: int = 64, n_modes: int = 2, prior_use_anatomy: bool = False,
                  local_dim: int = 0, prior_local_dim: int = 0,
                  prior_local_rank: int = 0, prior_local_n_roi: int = 0):
@@ -60,16 +61,29 @@ class ROIPairEmbedding(nn.Module):
         # 넣는 통로다. 0-init 이라 켜도 시작 cond 는 bit-exact 하다.
         self.local_dim = int(local_dim)
         self.local_proj = None
+        self.local_gain = None      # 켜면 local 항 크기를 pair 항 대비 비율로 직접 잡는다
+        self.prior_table_n_roi = int(n_roi)
         if self.local_dim:
             self.local_proj = nn.Sequential(nn.Linear(self.local_dim, hidden), nn.GELU(),
                                             nn.Linear(hidden, cond_dim))
             nn.init.zeros_(self.local_proj[-1].weight); nn.init.zeros_(self.local_proj[-1].bias)
+            if local_gain:
+                self.local_gain = nn.Parameter(torch.tensor(float(local_gain)))
         # 조건부 prior p(z | pair) = N(mu_pair, I). pair 정보가 z 공간에 직접 들어간다.
         # 근거: 같은 decoder 라도 z 를 GT posterior 은행에서 뽑으면 pair 정확도 0.66, N(0,I) 면 0.
         # 즉 decoder 는 z 에 실린 pair 정보를 듣는다. 0-init -> 시작은 N(0,I).
         self.latent_dim = latent_dim
+        # pair 별 자유 평균표. `prior_mu` 는 Linear(pair_vec) 이라 3321 pair 의 평균이 ROI 임베딩
+        # 64d 에서 나온 선형 함수 하나에 갇힌다. 실측(train 6명 x 256 pair): 지금 prior 가 설명하는
+        # posterior pair 평균의 분산 몫이 **-0.573** (상수보다 나쁘다), 같은 구조의 최선 적합이
+        # 0.633, 자유 표가 1.0 이다. 0-init 이라 켜도 시작은 bit-exact.
+        self.prior_mu_table = None
         self.prior_mu = nn.Linear(emb_dim, latent_dim)
         nn.init.zeros_(self.prior_mu.weight); nn.init.zeros_(self.prior_mu.bias)
+        if prior_mu_table:
+            n_pair = n_roi * (n_roi - 1) // 2
+            self.prior_mu_table = nn.Embedding(n_pair, latent_dim)
+            nn.init.zeros_(self.prior_mu_table.weight)
         # prior 의 **분산도 pair 마다 학습한다**. 지금까지 I 로 고정돼 있었는데 실측은
         # pair 안 GT latent sd 0.180 / prior sd 1.0 -> 차원당 5.6배 과대였다
         # (outputs/eval/w1e_latent_modality.json:latent_geometry). 분산만 고쳐도 오라클
@@ -158,6 +172,7 @@ class ROIPairEmbedding(nn.Module):
         m = self._mode_idx(mode, pairs.shape[0], pairs.device)
         v = self.pair_vec(pairs)
         mu = self.prior_mu(v) + self.mode_prior(m)
+        mu = mu + self.prior_table_term(pairs)
         ls = self.prior_log_sigma(v) + self.mode_log_sigma(m)
         if anatomy is not None:
             assert self.prior_use_anatomy, "anatomy prior 통로가 꺼져 있다 (prior_use_anatomy=False)"
@@ -193,10 +208,21 @@ class ROIPairEmbedding(nn.Module):
         lo, hi = self.prior_log_sigma_range
         return mu, ls.clamp(lo, hi)
 
+    def prior_table_term(self, pairs: torch.Tensor) -> torch.Tensor:
+        """pair 별 자유 평균표 항. 표가 없으면 0 (broadcast)."""
+        if self.prior_mu_table is None:
+            return torch.zeros((), device=pairs.device)
+        from .pair_anchor import upper_index
+        return self.prior_mu_table(upper_index(pairs[:, 0].long(), pairs[:, 1].long(),
+                                               self.prior_table_n_roi))
+
     def prior_mean(self, pairs: torch.Tensor, mode=0) -> torch.Tensor:
         """[N,2] -> mu_pair [N, latent_dim]. mode 는 int 또는 [N] tensor."""
         m = self._mode_idx(mode, pairs.shape[0], pairs.device)
-        return self.prior_mu(self.pair_vec(pairs)) + self.mode_prior(m)
+        mu = self.prior_mu(self.pair_vec(pairs)) + self.mode_prior(m)
+        # prior_params 와 같은 값을 내야 한다. prior_res 손실이 이 함수를 기준으로 쓰므로
+        # 표를 빼먹으면 두 경로가 서로 다른 "prior 평균" 을 보게 된다.
+        return mu + self.prior_table_term(pairs)
 
     def prior_log_std(self, pairs: torch.Tensor, mode=0, anatomy=None,
                       local: torch.Tensor | None = None) -> torch.Tensor:
@@ -241,7 +267,21 @@ class ROIPairEmbedding(nn.Module):
         if self.local_proj is not None:
             assert local is not None, "local_dim > 0 인데 local feature 가 안 넘어왔다"
             assert local.shape == (n, self.local_dim), (local.shape, n, self.local_dim)
-            c = c + self.local_proj(local)
+            lo = self.local_proj(local)
+            if self.local_gain is not None:
+                # 개인 정보를 나르는 유일한 항인데 0-init 에서 자라야 해서 너무 작게 남는다.
+                # 실측(J1, val 12명 x 256 pair): local 항 RMS 0.0014 vs pair 항 0.0334 -> 24 배 차이.
+                # 그래서 디코더 조건 벡터의 개인 성분이 0.04 % 다 (T1 볼륨은 7.99 %).
+                # 두 항을 각각 RMS 정규화하고 학습 가능한 배율을 곱해 크기를 구조로 보장한다.
+                # gain 을 현재 비율로 초기화하면 시작이 기존과 수치적으로 같다.
+                pr = self.proj(self.pair_vec(pairs))
+                # 배율은 **detach** 한다. 나누기를 미분 경로에 두면 local_proj 의 RMS 가 0.0014 라
+                # 기울기가 700 배로 튀어 gain 3.0 에서 NaN 이 났다 (실측). detach 하면 순전파 크기는
+                # 그대로 맞추면서 기울기는 상수배만 받는다.
+                sc = (pr.pow(2).mean().clamp_min(1e-12).sqrt()
+                      / lo.pow(2).mean().clamp_min(1e-12).sqrt()).detach()
+                lo = lo * sc * self.local_gain
+            c = c + lo
         else:
             assert local is None, "local_dim = 0 인데 local feature 가 넘어왔다"
         return c

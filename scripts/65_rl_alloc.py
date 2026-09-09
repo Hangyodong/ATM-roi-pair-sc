@@ -171,7 +171,13 @@ def main(a):
             n_rl, hist = rl_solve(A, Tm, n_base.astype(np.float64), iters=a.iters, damp=a.damp)
             tot = n_rl.sum()
             if a.max_total and tot > a.max_total:
+                # 상한이 걸리면 SC 총합이 그만큼 작아진다 -- 조용히 넘어가면 안 된다.
+                # trimming 을 켜면 가닥당 pair 기여가 29 -> 8.7 로 줄어 필요한 가닥이 3.3 배가 된다.
+                # 예전 상한 60 만이 31명 전원을 0.631 배로 눌러 총합비 0.671 이 됐다.
+                print(f"  [경고] {s}: 역산이 {int(tot):,} 가닥을 요구했으나 상한 {a.max_total:,} 로 "
+                      f"{a.max_total/tot:.3f} 배 축소 -> SC 총합이 그만큼 작아진다", flush=True)
                 n_rl = n_rl * (a.max_total / tot)
+            rec[f"{md}_clamped"] = float(min(1.0, (a.max_total or tot) / max(tot, 1e-9)))
             nn = np.clip(np.round(n_rl), 1, 20000).astype(np.int64)
             scm, ng, _ = generate_by_count(m, feat, pairs, nn, atlas, aff, R, local_roi=roi,
                                            seed=2000 + si, trim=trim)
@@ -208,7 +214,9 @@ if __name__ == "__main__":
     ap.add_argument("--subjects", default="outputs/splits/val.txt")
     ap.add_argument("--modes", default="count,gt")
     ap.add_argument("--total", type=int, default=460000)
-    ap.add_argument("--max-total", type=int, default=600000)
+    ap.add_argument("--max-total", type=int, default=1_500_000,
+                    help="생성 가닥 상한. trimming 을 켜면 가닥당 pair 기여가 1/3 이라 "
+                         "역산이 약 95 만 가닥을 요구한다 (GT 는 100 만)")
     ap.add_argument("--n-probe", type=int, default=8)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--damp", type=float, default=1.0)
